@@ -8,6 +8,8 @@ services:
     healthCheckPath: /api/health
     autoDeploy: true
     envVars:
+      - key: NODE_VERSION
+        value: 20
       - key: NODE_ENV
         value: production
       - key: API_HOST
@@ -22,31 +24,9 @@ services:
         value: true
       - key: AI_JUDGE_FORCE_LOCAL
         value: true
-      - key: SESSION_SECRET
-        sync: false
-      - key: ALLOWED_ORIGINS
-        sync: false
-      - key: RELEASE_VERSION
-        sync: false
-      - key: RELEASE_COMMIT
-        sync: false
-      - key: RELEASE_BUILD_TIME
-        sync: false
-      - key: OPENAI_API_KEY
-        sync: false
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_ROLE_KEY
-        sync: false
-      - key: SUPABASE_ANON_KEY
-        sync: false
-      - key: SUPABASE_STORAGE_MODE
-        sync: false
       - key: SMS_PROVIDER
-        sync: false
-      - key: SOLAPI_API_KEY
-        sync: false
-      - key: SOLAPI_API_SECRET
-        sync: false
-      - key: SOLAPI_SENDER_NUMBER
+        value: dev
+      - key: SUPABASE_STORAGE_MODE
+        value: snapshot
+      - key: SESSION_SECRET
         sync: false

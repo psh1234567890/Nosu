@@ -125,10 +125,8 @@ const SUPABASE_TABLE = process.env.SUPABASE_STATE_TABLE ?? `${SUPABASE_TABLE_PRE
 const SUPABASE_STORAGE_MODE = process.env.SUPABASE_STORAGE_MODE ?? "snapshot";
 const STATE_ID = process.env.APP_STATE_ID ?? "default";
 const hasSupabaseConfig =
-  Boolean(SUPABASE_URL) &&
-  Boolean(SUPABASE_KEY) &&
-  !SUPABASE_URL.includes("your-project-ref") &&
-  !SUPABASE_KEY.includes("your-service-role-or-secret-key");
+  isConfiguredUrl(SUPABASE_URL, ["your-project-ref", "placeholder"]) &&
+  isConfiguredSecret(SUPABASE_KEY, ["your-service-role-or-secret-key", "placeholder"]);
 const supabase =
   hasSupabaseConfig
     ? createClient(SUPABASE_URL, SUPABASE_KEY, {
@@ -157,6 +155,25 @@ function readListEnv(name, fallback) {
 function readPositiveIntEnv(name, fallback) {
   const value = Number(process.env[name] ?? fallback);
   return Number.isFinite(value) && value > 0 ? Math.round(value) : fallback;
+}
+
+function isConfiguredUrl(value, placeholders = []) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return false;
+  if (placeholders.some((placeholder) => raw.toLowerCase().includes(placeholder.toLowerCase()))) return false;
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "https:" || parsed.protocol === "http:";
+  } catch {
+    return false;
+  }
+}
+
+function isConfiguredSecret(value, placeholders = []) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return false;
+  if (raw.length < 12) return false;
+  return !placeholders.some((placeholder) => raw.toLowerCase().includes(placeholder.toLowerCase()));
 }
 
 function cleanReleaseValue(value) {
