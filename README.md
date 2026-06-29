@@ -75,6 +75,17 @@ The admin readiness panel also exports a launch handoff package (`nosu-best-laun
 
 `init:release-env`는 기존 파일을 덮어쓰지 않고 `deploy/.env.production` 초안을 만듭니다. 루트 `.env.production`은 Vite 빌드가 자동으로 읽을 수 있으므로 서버 배포 env는 `deploy/` 아래에 분리합니다. `replace-with-*` 값을 실제 도메인, 릴리스 커밋 SHA/빌드 시각, Supabase, SOLAPI, OpenAI 키로 바꾼 뒤 `check:release-env`를 실행합니다. `check:release-env`는 기본적으로 `deploy/.env.production`을 읽고, `NODE_ENV=production`, `API_HOST=0.0.0.0`, HTTPS `ALLOWED_ORIGINS`, `RELEASE_COMMIT`/`RELEASE_BUILD_TIME`, 데모/익명 쓰기 비활성화, SMS/Supabase/OpenAI 필수 키, 정규화 저장소 모드, `SHUTDOWN_GRACE_MS`, rate limit, 전화번호 인증 제한값이 실제 배포값인지 확인합니다. `verify`에는 실제 secret 없이 생성기와 체커 동작만 검증하는 `smoke:release-env`가 포함됩니다.
 
+### Render 빠른 배포
+
+이 저장소에는 Render Blueprint용 `render.yaml`이 포함되어 있습니다. Render에서 GitHub 저장소 `psh1234567890/Nosu`를 Blueprint로 연결하면 아래 값으로 Web Service가 생성됩니다.
+
+- Build Command: `npm ci && npm run build`
+- Start Command: `npm run start`
+- Health Check Path: `/api/health`
+- Runtime env: `NODE_ENV=production`, `API_HOST=0.0.0.0`, `SERVE_STATIC_APP=true`
+
+최초 데모 배포는 `AI_JUDGE_FORCE_LOCAL=true`와 파일 저장소로도 뜰 수 있지만, Render의 기본 파일 시스템은 재배포/재시작 시 유지되지 않을 수 있습니다. 실제 운영 데이터는 Supabase 값을 Render Environment에 넣고 `SUPABASE_STORAGE_MODE=snapshot` 또는 `normalized`로 전환하세요. 배포 URL이 나오면 `ALLOWED_ORIGINS=https://배포도메인`을 Render Environment에 추가하고 재배포합니다.
+
 인증 플로우만 빠르게 검증하는 독립 smoke:
 
 ```powershell

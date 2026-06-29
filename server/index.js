@@ -17,7 +17,7 @@ dotenv.config({ path: path.join(__dirname, "..", ".env") });
 const DATA_DIR = path.resolve(process.env.DATA_DIR ?? path.join(__dirname, "..", "data"));
 const STATE_FILE = path.resolve(process.env.STATE_FILE ?? path.join(DATA_DIR, "state.json"));
 const DIST_DIR = path.join(__dirname, "..", "dist");
-const PORT = Number(process.env.API_PORT ?? 4000);
+const PORT = Number(process.env.API_PORT ?? process.env.PORT ?? 4000);
 const API_HOST = process.env.API_HOST ?? "127.0.0.1";
 const PHONE_CODE_TTL_SECONDS = Number(process.env.PHONE_CODE_TTL_SECONDS ?? 300);
 const PHONE_CODE_RESEND_SECONDS = Number(process.env.PHONE_CODE_RESEND_SECONDS ?? 30);

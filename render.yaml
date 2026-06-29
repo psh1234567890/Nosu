@@ -1,0 +1,52 @@
+services:
+  - type: web
+    name: nosu-best
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: API_HOST
+        value: 0.0.0.0
+      - key: SERVE_STATIC_APP
+        value: true
+      - key: DATA_DIR
+        value: /tmp/nosu-best-data
+      - key: RELEASE_CHANNEL
+        value: production
+      - key: PHONE_CODE_HIDE_DEBUG
+        value: true
+      - key: AI_JUDGE_FORCE_LOCAL
+        value: true
+      - key: SESSION_SECRET
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: RELEASE_VERSION
+        sync: false
+      - key: RELEASE_COMMIT
+        sync: false
+      - key: RELEASE_BUILD_TIME
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_STORAGE_MODE
+        sync: false
+      - key: SMS_PROVIDER
+        sync: false
+      - key: SOLAPI_API_KEY
+        sync: false
+      - key: SOLAPI_API_SECRET
+        sync: false
+      - key: SOLAPI_SENDER_NUMBER
+        sync: false
