@@ -1,3 +1,7 @@
+-- Nosu Best production normalized storage schema.
+-- Run this in the Supabase SQL Editor before setting SUPABASE_STORAGE_MODE=normalized.
+-- The app checks these tables through GET /api/admin/storage-check before public launch.
+
 create table if not exists public.nb_users (
   id text primary key,
   login_id text unique not null,

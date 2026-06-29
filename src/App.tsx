@@ -63,6 +63,7 @@ type ChannelStatus = "waiting" | "live" | "voting" | "finished";
 type ChannelSort = "latest" | "waiting" | "live" | "finished";
 type DebatePhase = "ready" | "opening" | "crossfire" | "closing" | "voting" | "finished";
 type DebateStance = "agree" | "disagree";
+type AiJudgementStatus = "final" | "pending_review";
 type ReportTargetType = "channel" | "debate_message" | "spectator_message" | "user";
 type ReportStatus = "open" | "reviewing" | "resolved" | "dismissed";
 type AiAppealStatus = "pending" | "reviewing" | "resolved" | "dismissed";
@@ -211,12 +212,15 @@ interface AiCategoryScore {
 }
 
 interface AiJudgement {
-  winnerId: string;
+  status?: AiJudgementStatus;
+  source?: "openai" | "fallback";
+  failureCode?: string;
+  winnerId?: string;
   reasoning: string;
-  userScores: Record<string, number>;
-  categoryScores: Record<string, AiCategoryScore>;
-  voteScores: Record<string, number>;
-  finalScores: Record<string, number>;
+  userScores?: Record<string, number>;
+  categoryScores?: Record<string, AiCategoryScore>;
+  voteScores?: Record<string, number>;
+  finalScores?: Record<string, number>;
   decidedAt: string;
 }
 
@@ -865,7 +869,9 @@ interface ProviderDiagnosticsRuntime {
   ai: {
     configured: boolean;
     model: string;
+    timeoutMs?: number;
     forceLocal: boolean;
+    missingEnv?: string[];
     productionReady: boolean;
   };
   storage: {
@@ -3595,6 +3601,7 @@ export default function App() {
     : publicStatus?.notice?.active
       ? publicStatus.notice
       : null;
+  const canOpenAdminView = currentUser.role === "admin" || currentUser.role === "moderator";
   const canResetDemo = currentUser.role !== "member";
   const writeActionsDisabled = backendStatus === "offline" || backendStatus === "saving";
   const lastSyncLabel = lastSuccessfulSyncAt ? formatDateTime(lastSuccessfulSyncAt) : "아직 없음";
@@ -3636,7 +3643,9 @@ export default function App() {
         <nav className="topnav" aria-label="주요 메뉴">
           <NavButton active={view === "arena"} icon={<Radio size={18} />} label="토론장" onClick={() => setView("arena")} smokeId="nav-arena" />
           <NavButton active={view === "profile"} icon={<UserRound size={18} />} label="프로필" onClick={() => setView("profile")} smokeId="nav-profile" />
-          <NavButton active={view === "admin"} icon={<Settings size={18} />} label="운영" onClick={() => setView("admin")} smokeId="nav-admin" />
+          {canOpenAdminView && (
+            <NavButton active={view === "admin"} icon={<Settings size={18} />} label="운영" onClick={() => setView("admin")} smokeId="nav-admin" />
+          )}
           <NavButton active={view === "wallet"} icon={<Wallet size={18} />} label="코인" onClick={() => setView("wallet")} smokeId="nav-wallet" />
         </nav>
         <div className="account-strip">
@@ -3819,7 +3828,8 @@ export default function App() {
           onRefreshSession={refreshCurrentSession}
         />
       )}
-      {view === "admin" && (
+      {view === "admin" && !canOpenAdminView && <AdminAccessDenied />}
+      {view === "admin" && canOpenAdminView && (
         <AdminView
           state={state}
           currentUser={currentUser}
@@ -3853,6 +3863,16 @@ export default function App() {
       )}
       {view === "wallet" && <WalletView state={state} currentUser={currentUser} onPurchase={purchaseShopItem} />}
     </div>
+  );
+}
+
+function AdminAccessDenied() {
+  return (
+    <section className="empty-state" role="alert" aria-live="polite" data-smoke="admin-access-denied">
+      <ShieldCheck size={24} aria-hidden />
+      <strong>운영 권한이 필요합니다</strong>
+      <p>관리자 기능은 서버에서 승인된 운영자 세션으로만 사용할 수 있습니다.</p>
+    </section>
   );
 }
 
@@ -5535,7 +5555,11 @@ function ChannelDetail({
   const hasVoted = Boolean(currentVote);
   const canVote = channel.status === "voting" && isSpectator && !isParticipant && !hasVoted;
   const votedUser = users.find((user) => user.id === currentVote?.targetUserId);
-  const canFinalize = channel.status === "voting" && !channel.aiJudgement && (isParticipant || currentUser.role !== "member");
+  const pendingAiReview = channel.aiJudgement?.status === "pending_review" && !channel.finalResult;
+  const canFinalize =
+    channel.status === "voting" &&
+    !channel.finalResult &&
+    (pendingAiReview ? currentUser.role !== "member" : !channel.aiJudgement && (isParticipant || currentUser.role !== "member"));
   const canManageChannel = currentUser.role === "admin" || currentUser.role === "moderator";
   const canManageInviteCode = channel.visibility === "private" && (channel.createdBy === currentUser.id || canManageChannel);
   const activeUser = users.find((user) => user.id === channel.activeSpeakerId);
@@ -5705,6 +5729,7 @@ function ChannelDetail({
   const voteStatusText = (() => {
     if (channel.status !== "voting") return "";
     if (judging) return "AI 판정이 진행 중입니다.";
+    if (pendingAiReview) return "AI 판정이 자동 확정되지 않아 운영자 재판정을 기다립니다.";
     if (hasVoted) return `${votedUser?.displayName ?? "선택한 참가자"}에게 투표했습니다.`;
     if (isParticipant) return "참가자는 본인 토론에 투표하지 않습니다.";
     if (!isSpectator) return "관전 입장 후 투표할 수 있습니다.";
@@ -6045,11 +6070,11 @@ function ChannelDetail({
         </div>
         {voteStatusText && (
           <div
-            className={`vote-status-card ${hasVoted ? "done" : ""} ${judging ? "loading" : ""}`}
+            className={`vote-status-card ${hasVoted ? "done" : ""} ${judging ? "loading" : ""} ${pendingAiReview ? "pending" : ""}`}
             data-smoke="vote-status"
-            data-vote-state={hasVoted ? "done" : canVote ? "open" : "blocked"}
+            data-vote-state={pendingAiReview ? "pending-review" : hasVoted ? "done" : canVote ? "open" : "blocked"}
           >
-            {judging ? <Brain size={17} aria-hidden /> : hasVoted ? <CircleCheck size={17} aria-hidden /> : <Vote size={17} aria-hidden />}
+            {judging || pendingAiReview ? <Brain size={17} aria-hidden /> : hasVoted ? <CircleCheck size={17} aria-hidden /> : <Vote size={17} aria-hidden />}
             <span>{voteStatusText}</span>
           </div>
         )}
@@ -9929,7 +9954,12 @@ const readinessGuides: Record<string, ReadinessGuide> = {
   ai_judge: {
     title: "AI 판정 활성화",
     body: "토론 종료 후 관전자 투표와 AI 분석을 합산해 최종 승자를 계산합니다.",
-    envSnippet: ["OPENAI_API_KEY=your-openai-api-key", "OPENAI_JUDGE_MODEL=gpt-4o-mini"].join("\n"),
+    envSnippet: [
+      "OPENAI_API_KEY=replace-with-openai-api-key",
+      "OPENAI_JUDGE_MODEL=gpt-4o-mini",
+      "OPENAI_JUDGE_TIMEOUT_MS=20000",
+      "AI_JUDGE_FORCE_LOCAL=false",
+    ].join("\n"),
     steps: [
       "서버 환경변수에 OpenAI API 키를 추가합니다.",
       "헬스 체크에서 aiJudgeConfigured가 true인지 확인합니다.",
@@ -10562,7 +10592,13 @@ function ReadinessPanel({
           <span>
             <Brain size={15} aria-hidden />
             <b>AI judge</b>
-            <em>{providerDiagnostics.ai.productionReady ? providerDiagnostics.ai.model : "local fallback"}</em>
+            <em>
+              {providerDiagnostics.ai.productionReady
+                ? providerDiagnostics.ai.model
+                : providerDiagnostics.ai.forceLocal
+                  ? "force local"
+                  : "needs OpenAI key"}
+            </em>
           </span>
           <span>
             <Database size={15} aria-hidden />

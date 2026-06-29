@@ -10,6 +10,176 @@
 
 ## 대기
 
+### [완료] T19. Render 운영 환경변수와 release 표시값을 실제 배포 기준으로 정리
+
+- 목표: Render에 떠 있는 서비스가 현재 커밋, 빌드 시각, 운영 모드, 허용 origin을 정확히 보고하고 오래된 release 표시값 때문에 운영자가 혼동하지 않게 한다.
+- 직접 관련 파일: `render.yaml`, `server/index.js`, `README.md`
+- 구현 범위:
+  - `RELEASE_COMMIT`, `RELEASE_VERSION`, `RELEASE_BUILD_TIME`을 정적 placeholder가 아니라 배포 시점에 안전하게 주입하거나 없으면 명확히 미설정으로 표시한다.
+  - `/api/health`와 readiness payload에서 stale release 값과 현재 런타임 값을 구분한다.
+  - Render 환경변수 입력 순서를 README에 실제 운영용으로 정리한다.
+  - `ALLOWED_ORIGINS`와 Render URL 기본값이 서로 어긋나지 않게 한다.
+- 완료 조건:
+  - health 응답에서 현재 배포 커밋 또는 미설정 상태가 오해 없이 보인다.
+  - Render에 넣어야 하는 값과 repo에 남겨야 하는 값이 README에서 분리된다.
+  - 실제 secret 값은 문서나 코드에 남지 않는다.
+- 제외:
+  - Render 유료 플랜 변경은 하지 않는다.
+  - 실제 secret 입력은 사용자가 Render 대시보드에서 한다.
+
+### [완료] T20. Supabase production storage 전환 게이트 구현
+
+- 목표: 파일 기반 저장소나 snapshot 모드가 아니라 Supabase normalized 모드로 전환할 준비가 되었는지 서버가 명확히 판정하고, 설정 누락 시 운영 시작을 막는다.
+- 직접 관련 파일: `server/index.js`, `supabase/normalized-schema.sql`, `README.md`
+- 구현 범위:
+  - `SUPABASE_STORAGE_MODE=normalized`일 때 필요한 URL, anon key, service-role key, schema 준비 상태를 엄격히 검사한다.
+  - production에서 Supabase 설정이 누락되면 readiness에 명확한 blocker를 표시한다.
+  - schema 적용 순서와 `storage-check` 실행 순서를 README에 짧게 정리한다.
+  - snapshot/file fallback은 개발용임을 health/readiness에서 구분한다.
+- 완료 조건:
+  - production normalized 모드에서 필수 Supabase 값이 없으면 운영 가능으로 표시되지 않는다.
+  - schema/check 실행 순서만 보고 운영자가 다음 행동을 알 수 있다.
+  - 기존 로컬 file 모드는 개발 환경에서 계속 동작한다.
+- 제외:
+  - 실제 Supabase 원격 DB에 schema를 적용하지 않는다.
+  - 실제 데이터 마이그레이션 실행은 별도 티켓으로 둔다.
+
+### [완료] T21. 운영 관리자 접근 제어와 데모 모드 잠금 강화
+
+- 목표: 공개 URL에서 데모 관리자나 약한 세션으로 운영 기능에 접근하지 못하게 하고, 운영자 계정/권한 부여 흐름을 명확히 분리한다.
+- 직접 관련 파일: `server/index.js`, `src/App.tsx`
+- 구현 범위:
+  - production에서 `demoAuthEnabled`가 켜져 있으면 readiness blocker로 표시한다.
+  - 관리자 API가 서버 측 권한 확인을 반드시 거치도록 누락 지점을 점검하고 보강한다.
+  - 최초 관리자 지정 방식은 env var 또는 Supabase 사용자 메타데이터처럼 명확한 방식으로 제한한다.
+  - UI에서 운영자 전용 기능은 권한이 없을 때 숨기거나 접근 거부 메시지를 보여준다.
+- 완료 조건:
+  - 일반 사용자는 관리자 API와 관리자 화면 핵심 기능을 사용할 수 없다.
+  - production에서 데모 로그인/데모 관리자 경로가 운영 가능 상태로 표시되지 않는다.
+  - 권한 거부는 서버 응답과 UI에서 모두 명확하다.
+- 제외:
+  - 복잡한 RBAC 역할 관리 화면은 만들지 않는다.
+  - 외부 SSO 연동은 하지 않는다.
+
+### [완료] T22. Solapi 실문자 인증 전환 준비
+
+- 목표: SMS provider가 `dev`인 상태로 운영 가능하다고 착각하지 않게 하고, Solapi 실문자 인증을 켤 때 필요한 검증과 실패 처리를 갖춘다.
+- 직접 관련 파일: `server/index.js`, `README.md`
+- 구현 범위:
+  - production에서 `SMS_PROVIDER=dev`이거나 `PHONE_CODE_HIDE_DEBUG=false`이면 readiness blocker로 표시한다.
+  - Solapi API key, secret, 발신번호가 모두 있어야 실문자 provider가 configured로 판정되게 한다.
+  - SMS 전송 실패, 재시도 제한, 사용자 안내 문구를 정리한다.
+  - README에 Solapi 환경변수 이름과 대시보드 입력 위치만 적고 실제 값은 남기지 않는다.
+- 완료 조건:
+  - dev SMS 상태는 운영 가능으로 표시되지 않는다.
+  - Solapi 설정 누락 시 어떤 env var가 빠졌는지 알 수 있다.
+  - 실문자 전송 실패가 사용자에게 내부 오류 그대로 노출되지 않는다.
+- 제외:
+  - 실제 SMS 발송 테스트는 사용자 명시 요청 없이는 하지 않는다.
+  - 다른 SMS provider 연동은 하지 않는다.
+
+### [완료] T23. AI 판정 production 모드와 실패 fallback 정리
+
+- 목표: `AI_JUDGE_FORCE_LOCAL=true` 상태를 운영 blocker로 표시하고, OpenAI 판정이 실패해도 토론 결과 흐름이 안전하게 처리되게 한다.
+- 직접 관련 파일: `server/index.js`, `src/App.tsx`
+- 구현 범위:
+  - production에서 local 판정 강제 모드가 켜져 있으면 readiness blocker로 표시한다.
+  - OpenAI API key, model, timeout, 실패 메시지를 health/readiness에 안전하게 요약한다.
+  - AI 판정 실패 시 운영자 재판정 또는 보류 상태로 넘어가는 최소 fallback을 둔다.
+  - UI에서 판정 보류/실패 상태를 사용자에게 과장 없이 보여준다.
+- 완료 조건:
+  - production local AI 모드는 운영 가능으로 표시되지 않는다.
+  - OpenAI 설정이 누락되면 readiness에서 명확히 보인다.
+  - AI 호출 실패가 토론방 전체를 깨뜨리지 않는다.
+- 제외:
+  - 모델 품질 튜닝이나 프롬프트 대규모 개편은 하지 않는다.
+  - 실제 OpenAI 키 값은 저장하지 않는다.
+
+### [대기] T24. 증빙 파일 업로드와 Supabase Storage 연동
+
+- 목표: 프로필 인증, 신고, 이의제기 등 운영 증빙이 텍스트 URL에만 의존하지 않고 안전한 파일 업로드 경로를 갖게 한다.
+- 직접 관련 파일: `server/index.js`, `src/App.tsx`, `supabase/normalized-schema.sql`
+- 구현 범위:
+  - 허용 파일 타입, 크기 제한, 업로드 대상 bucket 이름을 서버 설정으로 분리한다.
+  - Supabase Storage 업로드용 signed URL 또는 서버 중계 방식을 최소 구현한다.
+  - 업로드된 파일 참조를 클레임/신고/이의제기 기록에 연결한다.
+  - UI에는 파일 선택, 업로드 진행, 실패 안내를 추가한다.
+- 완료 조건:
+  - 허용되지 않은 파일 타입과 큰 파일은 서버에서 거절된다.
+  - 업로드 성공 후 관련 운영 큐에서 파일 참조를 볼 수 있다.
+  - production storage 설정 누락은 readiness blocker로 표시된다.
+- 제외:
+  - 이미지 편집, 바이러스 검사, CDN 최적화는 하지 않는다.
+  - 공개 파일 브라우저는 만들지 않는다.
+
+### [대기] T25. 실제 운영용 약관/개인정보 문서 연결과 버전 관리 마무리
+
+- 목표: placeholder 약관 문구를 운영자가 교체할 수 있는 구조로 만들고, 사용자가 공개 URL에서 약관/개인정보 처리방침을 확인할 수 있게 한다.
+- 직접 관련 파일: `src/App.tsx`, `README.md`
+- 구현 범위:
+  - footer 또는 계정 화면에서 이용약관, 개인정보 처리방침, 커뮤니티 규칙 링크를 볼 수 있게 한다.
+  - 약관 버전과 동의 버전이 UI에서 확인 가능하게 한다.
+  - README에 실제 문안 교체 위치와 배포 전 확인 절차를 정리한다.
+  - placeholder 문구가 운영 모드에 남아 있으면 readiness에서 경고로 보이게 할 후속 연결 지점을 남긴다.
+- 완료 조건:
+  - 로그인하지 않은 사용자도 정책 문서 위치를 찾을 수 있다.
+  - 약관 버전 변경 시 재동의 흐름과 연결될 수 있다.
+  - 실제 법무 문안은 repo에 임의 작성하지 않는다.
+- 제외:
+  - 법률 검토나 최종 문안 작성은 하지 않는다.
+  - 외부 CMS 연동은 하지 않는다.
+
+### [대기] T26. 운영 rate limit과 악용 방어 기본값 강화
+
+- 목표: 회원가입, 로그인, 휴대폰 인증, 메시지, 신고, AI 판정 같은 비용/악용 위험이 있는 경로의 제한을 운영 기준으로 정리한다.
+- 직접 관련 파일: `server/index.js`, `src/App.tsx`
+- 구현 범위:
+  - production rate limit 기본값을 readiness에서 한 번에 볼 수 있게 한다.
+  - 휴대폰 인증, 로그인, AI 판정 요청에 대해 사용자/IP 기준 제한이 누락된 곳을 보강한다.
+  - 제한에 걸렸을 때 UI가 남은 시간 또는 재시도 안내를 보여준다.
+  - 운영자가 너무 느슨한 제한을 설정하면 경고가 보이게 한다.
+- 완료 조건:
+  - 주요 쓰기/비용 발생 API에는 rate limit이 적용된다.
+  - 제한 초과 응답은 사용자에게 이해 가능한 메시지로 표시된다.
+  - 기존 데모 흐름은 개발 환경에서 과도하게 막히지 않는다.
+- 제외:
+  - 외부 WAF, CAPTCHA, 봇 탐지 서비스 연동은 하지 않는다.
+  - 대규모 보안 감사는 별도 작업으로 둔다.
+
+### [대기] T27. 백업/복구와 데이터 보존 운영 절차 정리
+
+- 목표: 운영자가 Supabase 데이터와 감사 로그를 잃지 않고, 문제가 생겼을 때 복구 절차를 따라갈 수 있게 한다.
+- 직접 관련 파일: `server/index.js`, `README.md`
+- 구현 범위:
+  - readiness에 백업/복구 절차 문서화 여부와 audit log 보존 상태를 표시한다.
+  - README에 Supabase 백업 확인, export, 복구 리허설 순서를 짧게 정리한다.
+  - 앱 내부 export가 운영 데이터 전체 백업을 대체하지 않는다는 경고를 추가한다.
+  - 보존 한계에 가까운 audit log 상태를 운영자가 알 수 있게 한다.
+- 완료 조건:
+  - 운영자가 README만 보고 백업 확인과 복구 리허설 순서를 이해할 수 있다.
+  - readiness에서 백업/보존 관련 경고가 보인다.
+  - 실제 백업 파일이나 DB dump는 repo에 남지 않는다.
+- 제외:
+  - 실제 원격 백업 생성/복구 실행은 하지 않는다.
+  - 별도 백업 SaaS 연동은 하지 않는다.
+
+### [대기] T28. 운영 모니터링, 로그, 장애 대응 runbook 정리
+
+- 목표: Render에서 서비스가 죽거나 느려질 때 운영자가 로그, health, 배포 rollback 순서를 빠르게 확인할 수 있게 한다.
+- 직접 관련 파일: `server/index.js`, `render.yaml`, `README.md`
+- 구현 범위:
+  - `/api/health`가 운영자가 볼 핵심 상태를 짧고 안정적으로 반환하도록 정리한다.
+  - Render health check, 로그 확인, 수동 재배포, rollback 절차를 README에 정리한다.
+  - 서버 시작/종료/치명 오류 로그에 release와 storage mode를 포함한다.
+  - free instance spin-down 같은 Render 특성을 운영 문서에 명확히 적는다.
+- 완료 조건:
+  - 운영자는 장애 시 health, logs, events, rollback 순서를 따라갈 수 있다.
+  - 로그에 secret이 출력되지 않는다.
+  - Render health check path와 서버 endpoint가 일치한다.
+- 제외:
+  - 외부 APM/알림 서비스 연동은 하지 않는다.
+  - Render 유료 플랜 변경은 하지 않는다.
+
 ### [완료] T01. 운영 정책 설정 패널을 실제 서비스용으로 분리
 
 - 목표: 토론 시간, 보상 코인, 신고/제재 기본값처럼 서비스 운영자가 조정해야 하는 값을 코드 상수에만 두지 않고 관리자 화면에서 확인/저장할 수 있게 한다.

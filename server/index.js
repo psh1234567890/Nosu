@@ -29,6 +29,7 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const OPENAI_JUDGE_MODEL = process.env.OPENAI_JUDGE_MODEL ?? "gpt-4o-mini";
 const OPENAI_RESPONSES_URL = process.env.OPENAI_RESPONSES_URL ?? "https://api.openai.com/v1/responses";
 const AI_JUDGE_FORCE_LOCAL = readBooleanEnv("AI_JUDGE_FORCE_LOCAL", false);
+const OPENAI_JUDGE_TIMEOUT_MS = readPositiveIntEnv("OPENAI_JUDGE_TIMEOUT_MS", 20000);
 const OPENING_SECONDS = 90;
 const CLOSING_SECONDS = 60;
 const CROSSFIRE_SECONDS = 300;
@@ -88,12 +89,35 @@ const DEMO_AUTH_ENABLED = readBooleanEnv("ENABLE_DEMO_AUTH", !IS_PRODUCTION_RUNT
 const OPEN_STATE_WRITE_ENABLED = readBooleanEnv("ENABLE_OPEN_STATE_WRITE", !IS_PRODUCTION_RUNTIME);
 const SERVE_STATIC_APP = readBooleanEnv("SERVE_STATIC_APP", IS_PRODUCTION_RUNTIME);
 const APP_VERSION = "0.1.0";
-const RELEASE_VERSION = cleanReleaseValue(process.env.RELEASE_VERSION ?? process.env.npm_package_version ?? APP_VERSION);
-const RELEASE_CHANNEL = cleanReleaseValue(process.env.RELEASE_CHANNEL ?? (IS_PRODUCTION_RUNTIME ? "production" : "development"));
-const RELEASE_COMMIT = cleanReleaseValue(
-  process.env.RELEASE_COMMIT ?? process.env.VERCEL_GIT_COMMIT_SHA ?? process.env.GITHUB_SHA ?? "local",
-);
+const RELEASE_VERSION_ENV = readReleaseValue([
+  ["RELEASE_VERSION", process.env.RELEASE_VERSION],
+  ["npm_package_version", process.env.npm_package_version],
+]);
+const RELEASE_CHANNEL_ENV = readReleaseValue([["RELEASE_CHANNEL", process.env.RELEASE_CHANNEL]]);
+const RELEASE_COMMIT_ENV = readReleaseValue([
+  ["RENDER_GIT_COMMIT", process.env.RENDER_GIT_COMMIT],
+  ["RELEASE_COMMIT", process.env.RELEASE_COMMIT],
+  ["VERCEL_GIT_COMMIT_SHA", process.env.VERCEL_GIT_COMMIT_SHA],
+  ["GITHUB_SHA", process.env.GITHUB_SHA],
+]);
+const RELEASE_VERSION = RELEASE_VERSION_ENV.value;
+const RELEASE_VERSION_SOURCE = RELEASE_VERSION_ENV.source;
+const RELEASE_CHANNEL = RELEASE_CHANNEL_ENV.value || (IS_PRODUCTION_RUNTIME ? "production" : "development");
+const RELEASE_CHANNEL_SOURCE = RELEASE_CHANNEL_ENV.source || "runtime-default";
+const RELEASE_COMMIT = RELEASE_COMMIT_ENV.value;
+const RELEASE_COMMIT_SOURCE = RELEASE_COMMIT_ENV.source;
 const RELEASE_BUILD_TIME = normalizeReleaseBuildTime(process.env.RELEASE_BUILD_TIME ?? process.env.BUILD_TIME);
+const RELEASE_BUILD_TIME_SOURCE = process.env.RELEASE_BUILD_TIME
+  ? "RELEASE_BUILD_TIME"
+  : process.env.BUILD_TIME
+    ? "BUILD_TIME"
+    : null;
+const STALE_RELEASE_ENV_KEYS = [];
+if (process.env.RENDER_GIT_COMMIT && process.env.RELEASE_COMMIT) {
+  const renderCommit = cleanReleaseValue(process.env.RENDER_GIT_COMMIT);
+  const manualCommit = cleanReleaseValue(process.env.RELEASE_COMMIT);
+  if (renderCommit && manualCommit && renderCommit !== manualCommit) STALE_RELEASE_ENV_KEYS.push("RELEASE_COMMIT");
+}
 const PHONE_CODE_HIDE_DEBUG = readBooleanEnv("PHONE_CODE_HIDE_DEBUG", IS_PRODUCTION_RUNTIME);
 const EXPOSE_PHONE_DEBUG_CODE = !PHONE_CODE_HIDE_DEBUG;
 const SMS_PROVIDER = String(process.env.SMS_PROVIDER ?? "dev").trim().toLowerCase();
@@ -124,6 +148,10 @@ const SUPABASE_TABLE_PREFIX = process.env.SUPABASE_TABLE_PREFIX ?? "nb_";
 const SUPABASE_TABLE = process.env.SUPABASE_STATE_TABLE ?? `${SUPABASE_TABLE_PREFIX}app_state`;
 const SUPABASE_STORAGE_MODE = process.env.SUPABASE_STORAGE_MODE ?? "snapshot";
 const STATE_ID = process.env.APP_STATE_ID ?? "default";
+const SUPABASE_ENV_STATUS = supabaseEnvStatus();
+const PLATFORM_ADMIN_USER_IDS = new Set(readListEnv("PLATFORM_ADMIN_USER_IDS", []));
+const PLATFORM_ADMIN_LOGIN_IDS = new Set(readListEnv("PLATFORM_ADMIN_LOGIN_IDS", []));
+const PLATFORM_ADMIN_ALLOWLIST_CONFIGURED = PLATFORM_ADMIN_USER_IDS.size > 0 || PLATFORM_ADMIN_LOGIN_IDS.size > 0;
 const hasSupabaseConfig =
   isConfiguredUrl(SUPABASE_URL, ["your-project-ref", "placeholder"]) &&
   isConfiguredSecret(SUPABASE_KEY, ["your-service-role-or-secret-key", "placeholder"]);
@@ -134,7 +162,12 @@ const supabase =
       })
     : null;
 const usesNormalizedSupabase = Boolean(supabase) && SUPABASE_STORAGE_MODE === "normalized";
-const allowedOrigins = readListEnv("ALLOWED_ORIGINS", ["http://127.0.0.1:5173", "http://localhost:5173"]);
+const DEPLOY_EXTERNAL_URL = normalizeOriginUrl(process.env.RENDER_EXTERNAL_URL ?? process.env.PUBLIC_APP_URL);
+const defaultAllowedOrigins =
+  IS_PRODUCTION_RUNTIME && DEPLOY_EXTERNAL_URL
+    ? [DEPLOY_EXTERNAL_URL]
+    : ["http://127.0.0.1:5173", "http://localhost:5173"];
+const allowedOrigins = readListEnv("ALLOWED_ORIGINS", defaultAllowedOrigins);
 
 function readBooleanEnv(name, fallback) {
   const raw = process.env[name];
@@ -176,11 +209,31 @@ function isConfiguredSecret(value, placeholders = []) {
   return !placeholders.some((placeholder) => raw.toLowerCase().includes(placeholder.toLowerCase()));
 }
 
+function readReleaseValue(entries) {
+  for (const [source, value] of entries) {
+    const cleaned = cleanReleaseValue(value);
+    if (cleaned) return { value: cleaned, source };
+  }
+  return { value: "", source: null };
+}
+
 function cleanReleaseValue(value) {
   return String(value ?? "")
     .trim()
     .replace(/[^\w.@:/+-]/g, "-")
     .slice(0, 96);
+}
+
+function normalizeOriginUrl(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (!["http:", "https:"].includes(parsed.protocol)) return "";
+    return parsed.origin;
+  } catch {
+    return "";
+  }
 }
 
 function normalizeReleaseBuildTime(value) {
@@ -192,6 +245,31 @@ function normalizeReleaseBuildTime(value) {
 
 function normalizedTable(tableName) {
   return `${SUPABASE_TABLE_PREFIX}${tableName}`;
+}
+
+function supabaseEnvStatus() {
+  const missing = [];
+  const configured = {};
+  const urlConfigured = isConfiguredUrl(SUPABASE_URL, ["your-project-ref", "placeholder"]);
+  const serviceRoleConfigured = isConfiguredSecret(SUPABASE_KEY, [
+    "your-service-role-or-secret-key",
+    "your-service-role-key",
+    "placeholder",
+  ]);
+  const anonKeyConfigured = isConfiguredSecret(SUPABASE_ANON_KEY, ["your-supabase-anon-key", "placeholder"]);
+  configured.url = urlConfigured;
+  configured.serviceRoleKey = serviceRoleConfigured;
+  configured.anonKey = anonKeyConfigured;
+  if (!urlConfigured) missing.push("SUPABASE_URL");
+  if (!serviceRoleConfigured) missing.push("SUPABASE_SERVICE_ROLE_KEY");
+  if (!anonKeyConfigured) missing.push("SUPABASE_ANON_KEY or VITE_SUPABASE_ANON_KEY");
+  if (SUPABASE_STORAGE_MODE !== "normalized") missing.push("SUPABASE_STORAGE_MODE=normalized");
+  return {
+    configured,
+    missing,
+    normalizedRequested: SUPABASE_STORAGE_MODE === "normalized",
+    productionReady: missing.length === 0,
+  };
 }
 
 const PERMISSIONS_POLICY = "camera=(), microphone=(self), geolocation=()";
@@ -1001,6 +1079,7 @@ function hashPhoneCode(userId, phone, code) {
 }
 
 function publicPhoneCodePayload(code, record, delivery = { provider: "dev", sent: false }) {
+  const canExposeDebugCode = EXPOSE_PHONE_DEBUG_CODE && delivery.provider !== "solapi";
   return {
     ok: true,
     expiresAt: record.expiresAt,
@@ -1010,15 +1089,58 @@ function publicPhoneCodePayload(code, record, delivery = { provider: "dev", sent
     smsProvider: delivery.provider,
     smsSent: Boolean(delivery.sent),
     ...(delivery.deliveryId ? { smsDeliveryId: delivery.deliveryId } : {}),
-    ...(EXPOSE_PHONE_DEBUG_CODE ? { devCode: code } : {}),
+    ...(canExposeDebugCode ? { devCode: code } : {}),
+  };
+}
+
+function isConfiguredSolapiSender(value) {
+  const normalized = normalizePhoneNumber(value);
+  if (normalized.length < 8) return false;
+  return !["00000000", "0000000000", "01000000000", "01012345678"].includes(normalized);
+}
+
+function getSmsProviderStatus() {
+  const provider = SMS_PROVIDER || "dev";
+  const devProvider = ["dev", "console", "log"].includes(provider);
+  const solapiProvider = provider === "solapi";
+  const solapiKeyConfigured = isConfiguredSecret(SOLAPI_API_KEY, [
+    "your-solapi-api-key",
+    "replace-with-solapi-api-key",
+    "placeholder",
+  ]);
+  const solapiSecretConfigured = isConfiguredSecret(SOLAPI_API_SECRET, [
+    "your-solapi-api-secret",
+    "replace-with-solapi-api-secret",
+    "placeholder",
+  ]);
+  const solapiSenderConfigured = isConfiguredSolapiSender(SOLAPI_SENDER_NUMBER);
+  const solapiConfigured = solapiProvider && solapiKeyConfigured && solapiSecretConfigured && solapiSenderConfigured;
+  const missingEnv = [];
+
+  if (!solapiProvider) missingEnv.push("SMS_PROVIDER=solapi");
+  if (!solapiKeyConfigured) missingEnv.push("SOLAPI_API_KEY");
+  if (!solapiSecretConfigured) missingEnv.push("SOLAPI_API_SECRET");
+  if (!solapiSenderConfigured) missingEnv.push("SOLAPI_SENDER_NUMBER");
+  if (!PHONE_CODE_HIDE_DEBUG) missingEnv.push("PHONE_CODE_HIDE_DEBUG=true");
+
+  return {
+    provider,
+    supportedProvider: devProvider || solapiProvider,
+    devProvider,
+    realProvider: solapiProvider,
+    configured: solapiProvider ? solapiConfigured : devProvider && EXPOSE_PHONE_DEBUG_CODE,
+    solapiConfigured,
+    solapiKeyConfigured,
+    solapiSecretConfigured,
+    solapiSenderConfigured,
+    debugCodeExposed: EXPOSE_PHONE_DEBUG_CODE,
+    productionReady: solapiConfigured && PHONE_CODE_HIDE_DEBUG,
+    missingEnv,
   };
 }
 
 function isSmsProviderConfigured() {
-  if (SMS_PROVIDER === "solapi") {
-    return Boolean(SOLAPI_API_KEY && SOLAPI_API_SECRET && SOLAPI_SENDER_NUMBER);
-  }
-  return ["dev", "console", "log"].includes(SMS_PROVIDER) && EXPOSE_PHONE_DEBUG_CODE;
+  return getSmsProviderStatus().configured;
 }
 
 function createPhoneCodeMessage(code) {
@@ -1047,28 +1169,38 @@ async function sendPhoneVerificationCode(phone, code) {
   const text = createPhoneCodeMessage(code);
 
   if (provider === "solapi") {
-    if (!SOLAPI_API_KEY || !SOLAPI_API_SECRET || !SOLAPI_SENDER_NUMBER) {
-      return { provider, sent: false, error: "sms_provider_not_configured" };
+    const smsStatus = getSmsProviderStatus();
+    if (!smsStatus.solapiConfigured) {
+      return { provider, sent: false, error: "sms_provider_not_configured", missingEnv: smsStatus.missingEnv };
     }
 
-    const response = await fetch(`${SOLAPI_API_BASE_URL.replace(/\/$/, "")}/messages/v4/send-many/detail`, {
-      method: "POST",
-      headers: {
-        Authorization: createSolapiAuthHeader(),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        messages: [
-          {
-            to: normalizedPhone,
-            from: normalizePhoneNumber(SOLAPI_SENDER_NUMBER),
-            text,
-            autoTypeDetect: true,
-          },
-        ],
-        allowDuplicates: false,
-      }),
-    });
+    let response;
+    try {
+      response = await fetch(`${SOLAPI_API_BASE_URL.replace(/\/$/, "")}/messages/v4/send-many/detail`, {
+        method: "POST",
+        headers: {
+          Authorization: createSolapiAuthHeader(),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          messages: [
+            {
+              to: normalizedPhone,
+              from: normalizePhoneNumber(SOLAPI_SENDER_NUMBER),
+              text,
+              autoTypeDetect: true,
+            },
+          ],
+          allowDuplicates: false,
+        }),
+      });
+    } catch (error) {
+      console.error("Phone SMS send failed", {
+        provider,
+        errorName: error?.name ?? "FetchError",
+      });
+      return { provider, sent: false, error: "sms_send_failed" };
+    }
 
     const responseText = await response.text();
     let data = null;
@@ -1238,6 +1370,29 @@ function authStateForRequest(request, state) {
   return sanitizeState({ ...state, currentUserId: user?.id ?? null });
 }
 
+async function requireAdminRequest(request, response, next) {
+  try {
+    const payload = await readState();
+    if (!payload?.state) {
+      errorResponse(response, 409, "state_not_ready");
+      return;
+    }
+    const actor = requireSessionUser(request, response, payload.state);
+    if (!actor) return;
+    if (!canManagePlatform(actor)) {
+      errorResponse(response, 403, "not_authorized");
+      return;
+    }
+    if (request.body && typeof request.body === "object" && !Array.isArray(request.body)) {
+      request.body.actorId = actor.id;
+    }
+    request.platformManager = actor;
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+
 function sessionUserPayload(user) {
   if (!user) return null;
   const safeUser = sanitizeUser(user);
@@ -1374,9 +1529,46 @@ function extractResponseText(data) {
     .trim();
 }
 
+function getAiJudgeStatus() {
+  const configured = isConfiguredSecret(OPENAI_API_KEY, [
+    "replace-with-openai-api-key",
+    "your-openai-api-key",
+    "placeholder",
+  ]);
+  const missingEnv = [];
+  if (!configured) missingEnv.push("OPENAI_API_KEY");
+  if (AI_JUDGE_FORCE_LOCAL) missingEnv.push("AI_JUDGE_FORCE_LOCAL=false");
+  return {
+    configured,
+    model: OPENAI_JUDGE_MODEL,
+    responsesUrlConfigured: isConfiguredUrl(OPENAI_RESPONSES_URL),
+    timeoutMs: OPENAI_JUDGE_TIMEOUT_MS,
+    forceLocal: AI_JUDGE_FORCE_LOCAL,
+    missingEnv,
+    productionReady: configured && !AI_JUDGE_FORCE_LOCAL,
+  };
+}
+
+function isPendingAiJudgement(channel) {
+  return channel?.aiJudgement?.status === "pending_review" && !channel?.finalResult;
+}
+
+function hasFinalDebateResult(channel) {
+  return Boolean(channel?.finalResult && channel?.aiJudgement && !isPendingAiJudgement(channel));
+}
+
+function pendingAiReviewJudgement(reasonCode, attemptedAt) {
+  return {
+    status: "pending_review",
+    source: "openai",
+    decidedAt: attemptedAt,
+    failureCode: reasonCode,
+    reasoning: "AI 판정이 자동 확정되지 않아 운영자 재판정 대기 상태로 전환되었습니다.",
+  };
+}
+
 async function judgeWithOpenAI(channel) {
-  if (AI_JUDGE_FORCE_LOCAL) return null;
-  if (!OPENAI_API_KEY) return null;
+  if (!getAiJudgeStatus().configured) throw new Error("OpenAI judge is not configured");
   const compactChannel = {
     title: channel.title,
     participantIds: channel.participantIds,
@@ -1390,29 +1582,37 @@ async function judgeWithOpenAI(channel) {
     votes: channel.votes.map((vote) => ({ targetUserId: vote.targetUserId })),
   };
 
-  const response = await fetch(OPENAI_RESPONSES_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: OPENAI_JUDGE_MODEL,
-      input: [
-        {
-          role: "system",
-          content:
-            "You are a strict but fair Korean debate judge. Return only valid JSON. Judge debate quality, not popularity. Penalize personal attacks.",
-        },
-        {
-          role: "user",
-          content: `다음 토론을 판정하세요. 참가자 ID를 유지하고 JSON만 반환하세요. schema: {"winnerId":"id","reasoning":"Korean short explanation","categoryScores":{"id":{"logic":number,"evidence":number,"rebuttal":number,"relevance":number,"conduct":number,"total":number}}}\n\n${JSON.stringify(compactChannel)}`,
-        },
-      ],
-      temperature: 0.2,
-      max_output_tokens: 900,
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), OPENAI_JUDGE_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(OPENAI_RESPONSES_URL, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_JUDGE_MODEL,
+        input: [
+          {
+            role: "system",
+            content:
+              "You are a strict but fair Korean debate judge. Return only valid JSON. Judge debate quality, not popularity. Penalize personal attacks.",
+          },
+          {
+            role: "user",
+            content: `다음 토론을 판정하세요. 참가자 ID를 유지하고 JSON만 반환하세요. schema: {"winnerId":"id","reasoning":"Korean short explanation","categoryScores":{"id":{"logic":number,"evidence":number,"rebuttal":number,"relevance":number,"conduct":number,"total":number}}}\n\n${JSON.stringify(compactChannel)}`,
+          },
+        ],
+        temperature: 0.2,
+        max_output_tokens: 900,
+      }),
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
   if (!response.ok) {
     const text = await response.text();
     throw new Error(`OpenAI judge failed: ${response.status} ${text.slice(0, 160)}`);
@@ -1423,13 +1623,18 @@ async function judgeWithOpenAI(channel) {
 }
 
 function storagePayload() {
+  const normalizedActive = Boolean(supabase) && SUPABASE_STORAGE_MODE === "normalized";
   return {
     storage: supabase ? "supabase" : "file",
     storageMode: supabase ? SUPABASE_STORAGE_MODE : "file",
-    table: usesNormalizedSupabase ? `${SUPABASE_TABLE_PREFIX}*` : supabase ? SUPABASE_TABLE : null,
-    tablePrefix: supabase ? SUPABASE_TABLE_PREFIX : null,
+    requestedStorageMode: SUPABASE_STORAGE_MODE,
+    table: normalizedActive ? `${SUPABASE_TABLE_PREFIX}*` : supabase ? SUPABASE_TABLE : null,
+    tablePrefix: SUPABASE_TABLE_PREFIX,
     supabaseConfigured: Boolean(supabase),
-    normalized: usesNormalizedSupabase,
+    normalized: normalizedActive,
+    normalizedRequested: SUPABASE_ENV_STATUS.normalizedRequested,
+    missingEnv: SUPABASE_ENV_STATUS.missing,
+    productionReady: Boolean(supabase && normalizedActive && SUPABASE_ENV_STATUS.productionReady),
   };
 }
 
@@ -1465,31 +1670,44 @@ function processLifecyclePayload() {
 }
 
 function releaseIdentityPayload() {
-  const explicitCommit = RELEASE_COMMIT && RELEASE_COMMIT !== "local";
+  const missing = [];
+  if (!RELEASE_VERSION) missing.push("RELEASE_VERSION");
+  if (!RELEASE_COMMIT) missing.push("RENDER_GIT_COMMIT or RELEASE_COMMIT");
+  if (!RELEASE_BUILD_TIME) missing.push("RELEASE_BUILD_TIME");
+  const configured = missing.length === 0 && STALE_RELEASE_ENV_KEYS.length === 0;
   return {
     version: RELEASE_VERSION || APP_VERSION,
-    commit: RELEASE_COMMIT || "local",
-    commitShort: explicitCommit ? RELEASE_COMMIT.slice(0, 12) : "local",
-    channel: RELEASE_CHANNEL || (IS_PRODUCTION_RUNTIME ? "production" : "development"),
+    versionSource: RELEASE_VERSION_SOURCE || "app-default",
+    commit: RELEASE_COMMIT || null,
+    commitShort: RELEASE_COMMIT ? RELEASE_COMMIT.slice(0, 12) : null,
+    commitSource: RELEASE_COMMIT_SOURCE,
+    channel: RELEASE_CHANNEL,
+    channelSource: RELEASE_CHANNEL_SOURCE,
     buildTime: RELEASE_BUILD_TIME,
-    configured: Boolean(explicitCommit && RELEASE_BUILD_TIME && RELEASE_VERSION),
+    buildTimeSource: RELEASE_BUILD_TIME_SOURCE,
+    configured,
+    missing,
+    staleEnv: STALE_RELEASE_ENV_KEYS,
   };
 }
 
 function providerDiagnosticsPayload() {
   const storage = storagePayload();
-  const smsConfigured = isSmsProviderConfigured();
-  const smsUsesRealProvider = SMS_PROVIDER === "solapi";
+  const smsStatus = getSmsProviderStatus();
+  const aiStatus = getAiJudgeStatus();
   const oauthServerConfigured = Boolean(storage.supabaseConfigured);
   const oauthClientConfigured = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
   return {
     sms: {
-      provider: SMS_PROVIDER,
-      configured: smsConfigured,
-      realProvider: smsUsesRealProvider,
-      senderConfigured: Boolean(SOLAPI_SENDER_NUMBER),
-      debugCodeExposed: EXPOSE_PHONE_DEBUG_CODE,
-      productionReady: smsUsesRealProvider && smsConfigured && PHONE_CODE_HIDE_DEBUG,
+      provider: smsStatus.provider,
+      supportedProvider: smsStatus.supportedProvider,
+      configured: smsStatus.configured,
+      realProvider: smsStatus.realProvider,
+      solapiConfigured: smsStatus.solapiConfigured,
+      senderConfigured: smsStatus.solapiSenderConfigured,
+      debugCodeExposed: smsStatus.debugCodeExposed,
+      missingEnv: smsStatus.missingEnv,
+      productionReady: smsStatus.productionReady,
     },
     oauth: {
       serverConfigured: oauthServerConfigured,
@@ -1498,17 +1716,22 @@ function providerDiagnosticsPayload() {
       productionReady: oauthServerConfigured && oauthClientConfigured,
     },
     ai: {
-      configured: Boolean(OPENAI_API_KEY),
-      model: OPENAI_JUDGE_MODEL,
-      forceLocal: AI_JUDGE_FORCE_LOCAL,
-      productionReady: Boolean(OPENAI_API_KEY && !AI_JUDGE_FORCE_LOCAL),
+      configured: aiStatus.configured,
+      model: aiStatus.model,
+      timeoutMs: aiStatus.timeoutMs,
+      forceLocal: aiStatus.forceLocal,
+      missingEnv: aiStatus.missingEnv,
+      productionReady: aiStatus.productionReady,
     },
     storage: {
       storage: storage.storage,
       storageMode: storage.storageMode,
+      requestedStorageMode: storage.requestedStorageMode,
       supabaseConfigured: storage.supabaseConfigured,
       normalized: storage.normalized,
-      productionReady: storage.supabaseConfigured && storage.normalized,
+      normalizedRequested: storage.normalizedRequested,
+      missingEnv: storage.missingEnv,
+      productionReady: storage.productionReady,
     },
   };
 }
@@ -1527,6 +1750,12 @@ function runtimePayload() {
     permissionsPolicy: PERMISSIONS_POLICY,
     apiHost: API_HOST,
     allowedOrigins,
+    adminAccess: {
+      explicitAllowlistConfigured: PLATFORM_ADMIN_ALLOWLIST_CONFIGURED,
+      allowedUserIds: PLATFORM_ADMIN_USER_IDS.size,
+      allowedLoginIds: PLATFORM_ADMIN_LOGIN_IDS.size,
+      productionReady: !IS_PRODUCTION_RUNTIME || PLATFORM_ADMIN_ALLOWLIST_CONFIGURED,
+    },
     release: releaseIdentityPayload(),
     rateLimits: rateLimitPayload(),
     process: processLifecyclePayload(),
@@ -2775,6 +3004,46 @@ function buildNormalizedSyncSummary(beforeCounts, expectedCounts) {
   };
 }
 
+function buildNormalizedStorageGate(normalizedTables) {
+  const failedTables = normalizedTables.filter((table) => !table.ok);
+  const schemaReady = normalizedTables.length === NORMALIZED_TABLE_NAMES.length && failedTables.length === 0;
+  const envReady = SUPABASE_ENV_STATUS.productionReady && Boolean(supabase);
+  const ready = envReady && usesNormalizedSupabase && schemaReady;
+  const blockers = [];
+  if (!envReady) blockers.push(...SUPABASE_ENV_STATUS.missing);
+  if (envReady && !usesNormalizedSupabase) blockers.push("SUPABASE_STORAGE_MODE=normalized");
+  if (envReady && !schemaReady) {
+    blockers.push(
+      ...failedTables.map((table) => `${table.table}: ${table.error || "not queryable"}`),
+    );
+  }
+  return {
+    status: ready ? "ready" : "blocked",
+    ready,
+    envReady,
+    schemaReady,
+    normalizedActive: usesNormalizedSupabase,
+    requiredEnv: [
+      "SUPABASE_URL",
+      "SUPABASE_SERVICE_ROLE_KEY",
+      "SUPABASE_ANON_KEY or VITE_SUPABASE_ANON_KEY",
+      "SUPABASE_STORAGE_MODE=normalized",
+    ],
+    missingEnv: SUPABASE_ENV_STATUS.missing,
+    checkedTables: normalizedTables.length,
+    requiredTables: NORMALIZED_TABLE_NAMES.length,
+    failedTables: failedTables.map((table) => ({
+      key: table.key,
+      table: table.table,
+      error: table.error || "not queryable",
+    })),
+    blockers,
+    nextAction: ready
+      ? ""
+      : "Set the missing Supabase env vars, run supabase/normalized-schema.sql in Supabase SQL Editor, then call GET /api/admin/storage-check before switching public traffic.",
+  };
+}
+
 async function buildStorageCheck(payload) {
   const expectedCounts = payload?.state ? expectedNormalizedCounts(payload.state) : {};
   const expectedTotalRows = Object.values(expectedCounts).reduce((total, count) => total + count, 0);
@@ -2802,6 +3071,7 @@ async function buildStorageCheck(payload) {
     storageMode: payload?.storageMode ?? (supabase ? SUPABASE_STORAGE_MODE : "file"),
     savedAt: payload?.savedAt ?? null,
     checkedAt: new Date().toISOString(),
+    productionGate: buildNormalizedStorageGate(normalizedTables),
     expectedCounts,
     expectedTotalRows,
     integrityWarnings,
@@ -2912,15 +3182,21 @@ const launchEnvByReadinessCheck = {
   process_lifecycle: ["API_PORT=4000", "SHUTDOWN_GRACE_MS=8000", "DEBATE_CLOCK_TICK_MS=1000"],
   release_identity: [
     "RELEASE_VERSION=0.1.0",
-    "RELEASE_COMMIT=<git-sha>",
+    "RENDER_GIT_COMMIT=<render-provided-git-sha>",
     "RELEASE_CHANNEL=production",
     "RELEASE_BUILD_TIME=<iso-build-time>",
   ],
   storage: ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_STORAGE_MODE=normalized"],
   oauth: ["VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"],
   sms: ["SMS_PROVIDER=solapi", "SOLAPI_API_KEY", "SOLAPI_API_SECRET", "SOLAPI_SENDER_NUMBER", "PHONE_CODE_HIDE_DEBUG=true"],
-  ai_judge: ["OPENAI_API_KEY", "OPENAI_JUDGE_MODEL=gpt-4o-mini"],
-  security: ["NODE_ENV=production", "ENABLE_DEMO_AUTH=false", "ENABLE_OPEN_STATE_WRITE=false", "PHONE_CODE_HIDE_DEBUG=true"],
+  ai_judge: ["OPENAI_API_KEY", "OPENAI_JUDGE_MODEL=gpt-4o-mini", "OPENAI_JUDGE_TIMEOUT_MS=20000", "AI_JUDGE_FORCE_LOCAL=false"],
+  security: [
+    "NODE_ENV=production",
+    "PLATFORM_ADMIN_LOGIN_IDS=<comma-separated-admin-login-ids>",
+    "ENABLE_DEMO_AUTH=false",
+    "ENABLE_OPEN_STATE_WRITE=false",
+    "PHONE_CODE_HIDE_DEBUG=true",
+  ],
   abuse_limits: [
     "RATE_LIMIT_AUTH_WINDOW_SECONDS=600",
     "RATE_LIMIT_LOGIN_MAX=8",
@@ -2944,9 +3220,9 @@ const launchEnvTemplateByReadinessCheck = {
     title: "Release identity",
     lines: [
       "RELEASE_VERSION=0.1.0",
-      "RELEASE_COMMIT=<git-sha>",
+      "# Render normally provides RENDER_GIT_COMMIT automatically; set RELEASE_COMMIT only outside Render.",
       "RELEASE_CHANNEL=production",
-      "RELEASE_BUILD_TIME=2026-06-22T00:00:00.000Z",
+      "RELEASE_BUILD_TIME=<iso-build-time>",
     ],
   },
   storage: {
@@ -2973,7 +3249,7 @@ const launchEnvTemplateByReadinessCheck = {
       "SMS_PROVIDER=solapi",
       "SOLAPI_API_KEY=replace-with-solapi-api-key",
       "SOLAPI_API_SECRET=replace-with-solapi-api-secret",
-      "SOLAPI_SENDER_NUMBER=01000000000",
+      "SOLAPI_SENDER_NUMBER=replace-with-registered-solapi-sender-number",
       "PHONE_CODE_HIDE_DEBUG=true",
     ],
   },
@@ -2982,6 +3258,7 @@ const launchEnvTemplateByReadinessCheck = {
     lines: [
       "OPENAI_API_KEY=replace-with-openai-api-key",
       "OPENAI_JUDGE_MODEL=gpt-4o-mini",
+      "OPENAI_JUDGE_TIMEOUT_MS=20000",
       "AI_JUDGE_FORCE_LOCAL=false",
     ],
   },
@@ -2990,6 +3267,7 @@ const launchEnvTemplateByReadinessCheck = {
     lines: [
       "NODE_ENV=production",
       "SESSION_SECRET=replace-with-long-random-secret",
+      "PLATFORM_ADMIN_LOGIN_IDS=nosu",
       "ENABLE_DEMO_AUTH=false",
       "ENABLE_OPEN_STATE_WRITE=false",
       "PHONE_CODE_HIDE_DEBUG=true",
@@ -3013,7 +3291,7 @@ const launchEnvTemplateByReadinessCheck = {
     title: "Public API origin",
     lines: [
       "API_HOST=0.0.0.0",
-      "ALLOWED_ORIGINS=https://your-service.example.com",
+      "ALLOWED_ORIGINS=https://nosu-best.onrender.com",
     ],
   },
   static_app: {
@@ -3839,10 +4117,18 @@ function buildLaunchReadiness(checks, summary) {
 function buildOperationalReadiness(payload) {
   const storage = storagePayload();
   const runtime = runtimePayload();
-  const smsConfigured = isSmsProviderConfigured();
-  const usingRealSms = SMS_PROVIDER === "solapi" && smsConfigured;
+  const smsStatus = getSmsProviderStatus();
+  const aiStatus = getAiJudgeStatus();
+  const smsConfigured = smsStatus.configured;
   const productionSafetyReady =
-    IS_PRODUCTION_RUNTIME && !DEMO_AUTH_ENABLED && !OPEN_STATE_WRITE_ENABLED && PHONE_CODE_HIDE_DEBUG;
+    IS_PRODUCTION_RUNTIME &&
+    !DEMO_AUTH_ENABLED &&
+    !OPEN_STATE_WRITE_ENABLED &&
+    PHONE_CODE_HIDE_DEBUG &&
+    PLATFORM_ADMIN_ALLOWLIST_CONFIGURED;
+  const productionSafetyBlocked =
+    IS_PRODUCTION_RUNTIME &&
+    (DEMO_AUTH_ENABLED || OPEN_STATE_WRITE_ENABLED || !PHONE_CODE_HIDE_DEBUG || !PLATFORM_ADMIN_ALLOWLIST_CONFIGURED);
   const rateLimits = rateLimitPayload();
   const abuseLimitsReady =
     rateLimits.authWindowSeconds > 0 &&
@@ -3869,6 +4155,33 @@ function buildOperationalReadiness(payload) {
     : IS_PRODUCTION_RUNTIME
       ? "blocked"
       : "warning";
+  const storageStatus = storage.productionReady ? "ready" : IS_PRODUCTION_RUNTIME ? "blocked" : "warning";
+  const storageDetail = storage.productionReady
+    ? "Supabase normalized 모드에 필요한 URL, service-role key, anon key, storage mode가 설정되어 있습니다. /api/admin/storage-check로 정규 테이블 schema를 확인하세요."
+    : storage.missingEnv.length > 0
+      ? `Production Supabase gate is missing: ${storage.missingEnv.join(", ")}. Current storage=${storage.storage}, mode=${storage.storageMode}, requested=${storage.requestedStorageMode}.`
+      : `Supabase storage is not production-ready. Current storage=${storage.storage}, mode=${storage.storageMode}, requested=${storage.requestedStorageMode}.`;
+  const storageAction = storage.productionReady
+    ? ""
+    : "Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY, SUPABASE_STORAGE_MODE=normalized, run supabase/normalized-schema.sql, then call /api/admin/storage-check.";
+  const smsReadinessStatus = smsStatus.productionReady ? "ready" : IS_PRODUCTION_RUNTIME ? "blocked" : smsConfigured ? "warning" : "blocked";
+  const smsReadinessDetail = smsStatus.productionReady
+    ? "SOLAPI SMS is configured and debug verification codes are hidden."
+    : smsStatus.missingEnv.length > 0
+      ? `SMS production gate is missing: ${smsStatus.missingEnv.join(", ")}. Current provider=${smsStatus.provider}, debugCodeExposed=${smsStatus.debugCodeExposed}.`
+      : `SMS provider is not production-ready. Current provider=${smsStatus.provider}, debugCodeExposed=${smsStatus.debugCodeExposed}.`;
+  const smsReadinessAction = smsStatus.productionReady
+    ? ""
+    : "Set SMS_PROVIDER=solapi, SOLAPI_API_KEY, SOLAPI_API_SECRET, SOLAPI_SENDER_NUMBER, and PHONE_CODE_HIDE_DEBUG=true in Render Environment.";
+  const aiReadinessStatus = aiStatus.productionReady ? "ready" : IS_PRODUCTION_RUNTIME ? "blocked" : aiStatus.configured ? "warning" : "blocked";
+  const aiReadinessDetail = aiStatus.productionReady
+    ? `OpenAI judge is configured with ${aiStatus.model} and ${aiStatus.timeoutMs}ms timeout.`
+    : aiStatus.missingEnv.length > 0
+      ? `AI judge production gate is missing: ${aiStatus.missingEnv.join(", ")}. model=${aiStatus.model}, timeoutMs=${aiStatus.timeoutMs}.`
+      : `AI judge is not production-ready. model=${aiStatus.model}, timeoutMs=${aiStatus.timeoutMs}.`;
+  const aiReadinessAction = aiStatus.productionReady
+    ? ""
+    : "Set OPENAI_API_KEY, OPENAI_JUDGE_MODEL, OPENAI_JUDGE_TIMEOUT_MS, and AI_JUDGE_FORCE_LOCAL=false in Render Environment.";
 
   const checks = [
     createReadinessItem(
@@ -3886,21 +4199,17 @@ function buildOperationalReadiness(payload) {
       releaseIdentityStatus,
       releaseIdentity.configured
         ? `Release ${releaseIdentity.version} (${releaseIdentity.commitShort}) built at ${releaseIdentity.buildTime}.`
-        : `Release identity is incomplete: version=${releaseIdentity.version}, commit=${releaseIdentity.commitShort}, buildTime=${releaseIdentity.buildTime ?? "missing"}.`,
+        : `Release identity is incomplete: missing=${releaseIdentity.missing.join(", ") || "none"}, stale=${releaseIdentity.staleEnv.join(", ") || "none"}, commit=${releaseIdentity.commitShort ?? "unset"}, buildTime=${releaseIdentity.buildTime ?? "unset"}.`,
       releaseIdentity.configured
         ? ""
-        : "Set RELEASE_VERSION, RELEASE_COMMIT, RELEASE_CHANNEL, and RELEASE_BUILD_TIME in the production env before promotion.",
+        : "Let Render provide RENDER_GIT_COMMIT, remove stale RELEASE_COMMIT values, and set RELEASE_VERSION plus RELEASE_BUILD_TIME before promotion.",
     ),
     createReadinessItem(
       "storage",
       "Supabase 저장소",
-      storage.supabaseConfigured && storage.normalized ? "ready" : storage.supabaseConfigured ? "warning" : "blocked",
-      storage.supabaseConfigured
-        ? storage.normalized
-          ? "Supabase 정규 테이블을 사용 중입니다."
-          : "Supabase는 연결됐지만 스냅샷 저장 모드입니다."
-        : "Supabase 서버 키와 URL이 설정되지 않았습니다.",
-      storage.supabaseConfigured && storage.normalized ? "" : "SUPABASE_STORAGE_MODE=normalized와 정규 테이블을 확인하세요.",
+      storageStatus,
+      storageDetail,
+      storageAction,
     ),
     createReadinessItem(
       "oauth",
@@ -3918,33 +4227,27 @@ function buildOperationalReadiness(payload) {
     createReadinessItem(
       "sms",
       "전화번호 SMS 인증",
-      usingRealSms && PHONE_CODE_HIDE_DEBUG ? "ready" : smsConfigured ? "warning" : "blocked",
-      usingRealSms
-        ? PHONE_CODE_HIDE_DEBUG
-          ? "실제 SMS 발송과 인증번호 숨김이 활성화되어 있습니다."
-          : "실제 SMS 발송은 켜졌지만 응답에 인증번호가 노출됩니다."
-        : smsConfigured
-          ? "개발용 인증번호 모드입니다."
-          : "SMS 공급자 설정이 없어 운영 인증을 진행할 수 없습니다.",
-      usingRealSms && PHONE_CODE_HIDE_DEBUG
-        ? ""
-        : "SMS_PROVIDER=solapi와 SOLAPI 키를 설정하고 PHONE_CODE_HIDE_DEBUG=true로 전환하세요.",
+      smsReadinessStatus,
+      smsReadinessDetail,
+      smsReadinessAction,
     ),
     createReadinessItem(
       "ai_judge",
       "AI 판정",
-      OPENAI_API_KEY ? "ready" : "blocked",
-      OPENAI_API_KEY ? `${OPENAI_JUDGE_MODEL} 모델로 AI 판정이 설정되어 있습니다.` : "OpenAI API 키가 설정되지 않았습니다.",
-      OPENAI_API_KEY ? "" : "OPENAI_API_KEY를 서버 환경변수에 추가하세요.",
+      aiReadinessStatus,
+      aiReadinessDetail,
+      aiReadinessAction,
     ),
     createReadinessItem(
       "security",
       "운영 보안 스위치",
-      productionSafetyReady ? "ready" : "warning",
+      productionSafetyReady ? "ready" : productionSafetyBlocked ? "blocked" : "warning",
       productionSafetyReady
-        ? "프로덕션 런타임에서 데모 전환과 익명 쓰기가 닫혀 있습니다."
-        : `NODE_ENV=${process.env.NODE_ENV ?? "development"}, 데모=${DEMO_AUTH_ENABLED ? "열림" : "닫힘"}, 익명쓰기=${OPEN_STATE_WRITE_ENABLED ? "열림" : "닫힘"}`,
-      productionSafetyReady ? "" : "배포 환경에서는 NODE_ENV=production, ENABLE_DEMO_AUTH=false, ENABLE_OPEN_STATE_WRITE=false를 권장합니다.",
+        ? "프로덕션 런타임에서 데모 전환, 익명 쓰기, 디버그 코드가 닫혀 있고 관리자 allowlist가 설정되어 있습니다."
+        : `NODE_ENV=${process.env.NODE_ENV ?? "development"}, 데모=${DEMO_AUTH_ENABLED ? "열림" : "닫힘"}, 익명쓰기=${OPEN_STATE_WRITE_ENABLED ? "열림" : "닫힘"}, 관리자 allowlist=${PLATFORM_ADMIN_ALLOWLIST_CONFIGURED ? "설정됨" : "미설정"}`,
+      productionSafetyReady
+        ? ""
+        : "배포 환경에서는 PLATFORM_ADMIN_LOGIN_IDS 또는 PLATFORM_ADMIN_USER_IDS를 설정하고, ENABLE_DEMO_AUTH=false, ENABLE_OPEN_STATE_WRITE=false, PHONE_CODE_HIDE_DEBUG=true를 유지하세요.",
     ),
     createReadinessItem(
       "abuse_limits",
@@ -4037,8 +4340,8 @@ function buildOperationalReadiness(payload) {
       realtime: true,
       clients: io.engine.clientsCount,
       release: runtime.release,
-      aiJudgeConfigured: Boolean(OPENAI_API_KEY),
-      judgeModel: OPENAI_JUDGE_MODEL,
+      aiJudgeConfigured: aiStatus.configured,
+      judgeModel: aiStatus.model,
       smsProvider: SMS_PROVIDER,
       smsConfigured,
       oauthConfigured: Boolean(storage.supabaseConfigured && SUPABASE_ANON_KEY),
@@ -4056,13 +4359,14 @@ function buildOperationalReadiness(payload) {
 }
 
 app.get("/api/health", (_request, response) => {
+  const aiStatus = getAiJudgeStatus();
   const payload = {
     ok: !shuttingDown,
     service: "nosu-best-api",
     realtime: true,
     clients: io.engine.clientsCount,
-    aiJudgeConfigured: Boolean(OPENAI_API_KEY),
-    judgeModel: OPENAI_JUDGE_MODEL,
+    aiJudgeConfigured: aiStatus.configured,
+    judgeModel: aiStatus.model,
     smsProvider: SMS_PROVIDER,
     smsConfigured: isSmsProviderConfigured(),
     phoneDebugCodeExposed: EXPOSE_PHONE_DEBUG_CODE,
@@ -4095,6 +4399,8 @@ app.get("/api/state", async (request, response, next) => {
     next(error);
   }
 });
+
+app.use("/api/admin", requireAdminRequest);
 
 app.get("/api/admin/storage-check", async (request, response, next) => {
   try {
@@ -6020,6 +6326,9 @@ function canForceVoting(user, channel) {
 }
 
 function canFinalizeDebate(user, channel) {
+  if (isPendingAiJudgement(channel)) {
+    return canManagePlatform(user);
+  }
   return Boolean(
     user &&
       (user.role === "admin" ||
@@ -6029,11 +6338,14 @@ function canFinalizeDebate(user, channel) {
 }
 
 function canManagePlatform(user) {
-  return Boolean(isActiveUser(user) && (user.role === "admin" || user.role === "moderator"));
+  if (!isActiveUser(user) || !["admin", "moderator"].includes(user.role)) return false;
+  if (!IS_PRODUCTION_RUNTIME) return true;
+  if (!PLATFORM_ADMIN_ALLOWLIST_CONFIGURED) return false;
+  return PLATFORM_ADMIN_USER_IDS.has(user.id) || PLATFORM_ADMIN_LOGIN_IDS.has(user.loginId);
 }
 
 function canManageRoles(user) {
-  return Boolean(user && user.role === "admin");
+  return Boolean(canManagePlatform(user) && user.role === "admin");
 }
 
 function isSanctionActive(sanction, nowMs = Date.now()) {
@@ -7486,7 +7798,7 @@ app.post("/api/auth/password-reset/request-code", async (request, response, next
       expiresAt: now + PHONE_CODE_TTL_SECONDS * 1000,
     };
     const delivery = await sendPhoneVerificationCode(phone, code);
-    if (!delivery.sent && !EXPOSE_PHONE_DEBUG_CODE) {
+    if (!delivery.sent && (delivery.provider === "solapi" || !EXPOSE_PHONE_DEBUG_CODE)) {
       errorResponse(response, delivery.error === "sms_send_failed" ? 502 : 503, delivery.error ?? "sms_send_failed");
       return;
     }
@@ -8095,7 +8407,7 @@ app.post("/api/auth/phone/request-code", async (request, response, next) => {
       expiresAt: now + PHONE_CODE_TTL_SECONDS * 1000,
     };
     const delivery = await sendPhoneVerificationCode(phone, code);
-    if (!delivery.sent && !EXPOSE_PHONE_DEBUG_CODE) {
+    if (!delivery.sent && (delivery.provider === "solapi" || !EXPOSE_PHONE_DEBUG_CODE)) {
       errorResponse(response, delivery.error === "sms_send_failed" ? 502 : 503, delivery.error ?? "sms_send_failed");
       return;
     }
@@ -8484,7 +8796,7 @@ app.post("/api/ai/judge", async (request, response, next) => {
       errorResponse(response, 400, "not_enough_participants");
       return;
     }
-    if (channel.aiJudgement || channel.finalResult) {
+    if (hasFinalDebateResult(channel)) {
       response.json({ ok: true, state: sanitizeState(payload.state), source: "existing", alreadyFinalized: true });
       return;
     }
@@ -8500,14 +8812,24 @@ app.post("/api/ai/judge", async (request, response, next) => {
     judgingChannels.add(channelId);
     let parsed = null;
     let source = "fallback";
+    let judgeFailureCode = "";
+    const aiStatus = getAiJudgeStatus();
     const forceLocalJudge = AI_JUDGE_FORCE_LOCAL || (!IS_PRODUCTION_RUNTIME && Boolean(request.body?.forceLocal));
     try {
-      if (!forceLocalJudge) {
+      if (forceLocalJudge) {
+        judgeFailureCode = AI_JUDGE_FORCE_LOCAL ? "local_judge_forced" : "local_judge_requested";
+      } else if (!aiStatus.configured) {
+        judgeFailureCode = "missing_openai_config";
+      } else {
         parsed = await judgeWithOpenAI(channel);
-        source = "openai";
+        if (parsed) source = "openai";
       }
     } catch (error) {
-      console.warn(error.message);
+      judgeFailureCode = error?.name === "AbortError" ? "openai_judge_timeout" : "openai_judge_failed";
+      console.warn("OpenAI judge failed", {
+        reason: judgeFailureCode,
+        message: String(error?.message ?? "").slice(0, 160),
+      });
     }
 
     const latestPayload = await readState();
@@ -8520,12 +8842,53 @@ app.post("/api/ai/judge", async (request, response, next) => {
       errorResponse(response, 404, "channel_not_found");
       return;
     }
-    if (latestChannel.aiJudgement || latestChannel.finalResult) {
+    if (hasFinalDebateResult(latestChannel)) {
       response.json({ ok: true, state: sanitizeState(latestPayload.state), source: "existing", alreadyFinalized: true });
       return;
     }
     if (latestChannel.status !== "voting") {
       errorResponse(response, 400, "voting_not_open");
+      return;
+    }
+
+    if (IS_PRODUCTION_RUNTIME && !parsed) {
+      const attemptedAt = nowLabel();
+      const pendingJudgement = pendingAiReviewJudgement(judgeFailureCode || "openai_judge_unavailable", attemptedAt);
+      const pendingState = addNotifications({
+        ...latestPayload.state,
+        channels: latestPayload.state.channels.map((item) =>
+          item.id === channelId
+            ? { ...item, status: "voting", phase: "voting", aiJudgement: pendingJudgement, finalResult: undefined }
+            : item,
+        ),
+      }, latestChannel.participantIds.map((participantId) =>
+        createNotification({
+          userId: participantId,
+          kind: "debate",
+          title: "AI 판정 보류",
+          body: `"${latestChannel.title}" 판정이 자동 확정되지 않아 운영자 재판정을 기다립니다.`,
+          view: "arena",
+          channelId: latestChannel.id,
+          roomId: latestChannel.roomId,
+        }),
+      ));
+      const managerNotifiedState = notifyPlatformManagers(pendingState, {
+        kind: "debate",
+        title: "AI 판정 재검토 필요",
+        body: `"${latestChannel.title}" 판정이 ${pendingJudgement.failureCode} 상태로 보류되었습니다.`,
+        view: "admin",
+        channelId: latestChannel.id,
+        roomId: latestChannel.roomId,
+      });
+      const auditedState = addAuditLog(managerNotifiedState, user, {
+        action: "ai_judge_pending_review",
+        targetType: "channel",
+        targetId: channelId,
+        summary: `AI 판정이 자동 확정되지 않아 "${latestChannel.title}" 채널을 보류 상태로 전환했습니다.`,
+        metadata: { reason: pendingJudgement.failureCode, model: aiStatus.model, timeoutMs: aiStatus.timeoutMs },
+      });
+      const saved = await writeStateAndBroadcast(auditedState, "ai_judge_pending_review");
+      response.json({ ok: true, source: "pending_review", pendingReview: true, state: saved.state });
       return;
     }
 
@@ -8537,6 +8900,8 @@ app.post("/api/ai/judge", async (request, response, next) => {
     );
     const judgedAt = nowLabel();
     const aiJudgement = {
+      status: "final",
+      source: judged.source,
       winnerId: judged.winnerId,
       userScores: judged.userScores,
       categoryScores: judged.categoryScores,

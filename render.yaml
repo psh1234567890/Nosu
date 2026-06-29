@@ -18,6 +18,10 @@ services:
         value: true
       - key: DATA_DIR
         value: /tmp/nosu-best-data
+      - key: ALLOWED_ORIGINS
+        value: https://nosu-best.onrender.com
+      - key: RELEASE_VERSION
+        value: 0.1.0
       - key: RELEASE_CHANNEL
         value: production
       - key: PHONE_CODE_HIDE_DEBUG
