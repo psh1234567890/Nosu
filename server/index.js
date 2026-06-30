@@ -68,8 +68,17 @@ const PLATFORM_SETTING_LIMITS = {
   suspensionDefaultHours: { min: 1, max: 720 },
 };
 const MAX_PROFILE_PHOTO_BYTES = 1_000_000;
+const MAX_EVIDENCE_FILE_BYTES = readPositiveIntEnv("EVIDENCE_FILE_MAX_BYTES", 1_500_000);
 const MAX_AUDIT_LOGS = readPositiveIntEnv("MAX_AUDIT_LOGS", 300);
 const PROFILE_PHOTO_BUCKET = process.env.SUPABASE_PROFILE_PHOTO_BUCKET ?? "profile-photos";
+const EVIDENCE_FILE_BUCKET = process.env.SUPABASE_EVIDENCE_FILE_BUCKET ?? "evidence-files";
+const EVIDENCE_FILE_ALLOWED_MIME_TYPES = readListEnv("EVIDENCE_FILE_ALLOWED_MIME_TYPES", [
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "application/pdf",
+  "text/plain",
+]);
 const DEBATE_CLOCK_TICK_MS = Number(process.env.DEBATE_CLOCK_TICK_MS ?? 1000);
 const PASSWORD_ITERATIONS = 120_000;
 const PASSWORD_KEY_LENGTH = 32;
@@ -136,6 +145,7 @@ const RATE_LIMIT_PASSWORD_MAX = readPositiveIntEnv("RATE_LIMIT_PASSWORD_MAX", 6)
 const RATE_LIMIT_WRITE_WINDOW_SECONDS = readPositiveIntEnv("RATE_LIMIT_WRITE_WINDOW_SECONDS", 60);
 const RATE_LIMIT_MESSAGE_MAX = readPositiveIntEnv("RATE_LIMIT_MESSAGE_MAX", 30);
 const RATE_LIMIT_REPORT_MAX = readPositiveIntEnv("RATE_LIMIT_REPORT_MAX", 10);
+const RATE_LIMIT_AI_JUDGE_MAX = readPositiveIntEnv("RATE_LIMIT_AI_JUDGE_MAX", 6);
 const SHUTDOWN_GRACE_MS = readPositiveIntEnv("SHUTDOWN_GRACE_MS", 8000);
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY ?? process.env.SUPABASE_SECRET_KEY;
@@ -1638,8 +1648,24 @@ function storagePayload() {
   };
 }
 
-function rateLimitPayload() {
+function evidenceStoragePayload() {
+  const missingEnv = [];
+  if (!supabase) missingEnv.push("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY");
+  if (!EVIDENCE_FILE_BUCKET.trim()) missingEnv.push("SUPABASE_EVIDENCE_FILE_BUCKET");
+  if (EVIDENCE_FILE_ALLOWED_MIME_TYPES.length === 0) missingEnv.push("EVIDENCE_FILE_ALLOWED_MIME_TYPES");
+  if (MAX_EVIDENCE_FILE_BYTES <= 0) missingEnv.push("EVIDENCE_FILE_MAX_BYTES");
   return {
+    bucket: EVIDENCE_FILE_BUCKET,
+    maxBytes: MAX_EVIDENCE_FILE_BYTES,
+    allowedMimeTypes: EVIDENCE_FILE_ALLOWED_MIME_TYPES,
+    configured: missingEnv.length === 0,
+    missingEnv: [...new Set(missingEnv)],
+    productionReady: missingEnv.length === 0,
+  };
+}
+
+function rateLimitPayload() {
+  const payload = {
     authWindowSeconds: RATE_LIMIT_AUTH_WINDOW_SECONDS,
     writeWindowSeconds: RATE_LIMIT_WRITE_WINDOW_SECONDS,
     loginMax: RATE_LIMIT_LOGIN_MAX,
@@ -1651,11 +1677,31 @@ function rateLimitPayload() {
     passwordMax: RATE_LIMIT_PASSWORD_MAX,
     messageMax: RATE_LIMIT_MESSAGE_MAX,
     reportMax: RATE_LIMIT_REPORT_MAX,
+    aiJudgeMax: RATE_LIMIT_AI_JUDGE_MAX,
     phoneCodeTtlSeconds: PHONE_CODE_TTL_SECONDS,
     phoneCodeResendSeconds: PHONE_CODE_RESEND_SECONDS,
     phoneCodeMaxAttempts: PHONE_CODE_MAX_ATTEMPTS,
     activeBuckets: rateLimitBuckets.size,
   };
+  return {
+    ...payload,
+    warnings: rateLimitWarningLabels(payload),
+  };
+}
+
+function rateLimitWarningLabels(rateLimits) {
+  const warnings = [];
+  if (rateLimits.authWindowSeconds < 300) warnings.push("auth window < 300s");
+  if (rateLimits.writeWindowSeconds < 30) warnings.push("write window < 30s");
+  if (rateLimits.loginMax > 12) warnings.push("login > 12");
+  if (rateLimits.signupMax > 10) warnings.push("signup > 10");
+  if (rateLimits.phoneRequestMax > 8) warnings.push("phone request > 8");
+  if (rateLimits.phoneVerifyMax > 20) warnings.push("phone verify > 20");
+  if (rateLimits.passwordMax > 10) warnings.push("password > 10");
+  if (rateLimits.messageMax > 60) warnings.push("message > 60");
+  if (rateLimits.reportMax > 20) warnings.push("report > 20");
+  if (rateLimits.aiJudgeMax > 8) warnings.push("AI judge > 8");
+  return warnings;
 }
 
 function processLifecyclePayload() {
@@ -1693,6 +1739,7 @@ function releaseIdentityPayload() {
 
 function providerDiagnosticsPayload() {
   const storage = storagePayload();
+  const evidenceStorage = evidenceStoragePayload();
   const smsStatus = getSmsProviderStatus();
   const aiStatus = getAiJudgeStatus();
   const oauthServerConfigured = Boolean(storage.supabaseConfigured);
@@ -1733,6 +1780,7 @@ function providerDiagnosticsPayload() {
       missingEnv: storage.missingEnv,
       productionReady: storage.productionReady,
     },
+    evidenceStorage,
   };
 }
 
@@ -1760,6 +1808,59 @@ function runtimePayload() {
     rateLimits: rateLimitPayload(),
     process: processLifecyclePayload(),
     providerDiagnostics: providerDiagnosticsPayload(),
+  };
+}
+
+function monitoringPayload() {
+  const release = releaseIdentityPayload();
+  const storage = storagePayload();
+  const lifecycle = processLifecyclePayload();
+  return {
+    healthCheckPath: "/api/health",
+    ok: !shuttingDown,
+    status: shuttingDown ? "shutting_down" : "running",
+    release: {
+      version: release.version,
+      commitShort: release.commitShort,
+      channel: release.channel,
+      buildTime: release.buildTime,
+      configured: release.configured,
+    },
+    storage: {
+      storage: storage.storage,
+      storageMode: storage.storageMode,
+      normalized: storage.normalized,
+      productionReady: storage.productionReady,
+    },
+    process: {
+      pid: lifecycle.pid,
+      startedAt: lifecycle.startedAt,
+      uptimeSeconds: lifecycle.uptimeSeconds,
+      shuttingDown: lifecycle.shuttingDown,
+      shutdownStartedAt: lifecycle.shutdownStartedAt,
+      shutdownGraceMs: lifecycle.shutdownGraceMs,
+    },
+  };
+}
+
+function operationalLogContext() {
+  const monitoring = monitoringPayload();
+  return {
+    releaseVersion: monitoring.release.version,
+    releaseCommit: monitoring.release.commitShort ?? "unset",
+    releaseChannel: monitoring.release.channel,
+    storage: monitoring.storage.storage,
+    storageMode: monitoring.storage.storageMode,
+    normalized: monitoring.storage.normalized,
+    pid: monitoring.process.pid,
+  };
+}
+
+function errorLogSummary(error) {
+  return {
+    errorName: error?.name ?? "Error",
+    errorCode: error?.code ?? undefined,
+    statusCode: error?.statusCode ?? error?.status ?? undefined,
   };
 }
 
@@ -2045,6 +2146,7 @@ function normalizeStoredReport(report) {
     assigneeName: report?.assigneeName ? String(report.assigneeName) : undefined,
     assignedAt: report?.assignedAt ? String(report.assignedAt) : undefined,
     reviewMemo: sanitizeReportMemo(report?.reviewMemo),
+    evidenceFiles: sanitizeEvidenceFiles(report?.evidenceFiles),
     statusHistory: jsonArray(report?.statusHistory)
       .map((item) => ({
         status: normalizeReportStatus(item?.status),
@@ -2073,6 +2175,7 @@ function normalizeAiAppeal(appeal) {
     reviewerId: appeal?.reviewerId ? String(appeal.reviewerId).slice(0, 80) : undefined,
     reviewerName: appeal?.reviewerName ? String(appeal.reviewerName).slice(0, 80) : undefined,
     reviewMemo: appeal?.reviewMemo ? String(appeal.reviewMemo).trim().slice(0, 500) : undefined,
+    evidenceFiles: sanitizeEvidenceFiles(appeal?.evidenceFiles),
   };
 }
 
@@ -2410,6 +2513,7 @@ async function readNormalizedState() {
         submittedReason: claim.submitted_reason ?? claim.submittedReason ?? "",
         evidenceText: claim.evidence_text ?? claim.evidenceText ?? "",
         evidenceUrl: claim.evidence_url ?? claim.evidenceUrl ?? "",
+        evidenceFiles: sanitizeEvidenceFiles(claim.evidence_files ?? claim.evidenceFiles),
         submittedAt: claim.submitted_at ?? claim.submittedAt ?? "",
         reviewerId: claim.reviewer_id ?? claim.reviewerId ?? "",
         reviewerName: claim.reviewer_name ?? claim.reviewerName ?? "",
@@ -2514,6 +2618,7 @@ async function readNormalizedState() {
       createdAt: report.created_at_text,
       resolvedAt: report.resolved_at_text ?? undefined,
       resolvedBy: report.resolved_by ?? undefined,
+      evidenceFiles: sanitizeEvidenceFiles(report.evidence_files ?? report.evidenceFiles),
     })),
     sanctions,
     notifications,
@@ -2709,6 +2814,15 @@ function buildNormalizedRows(state, { includeSecrets = false } = {}) {
       label: claim.label,
       value: claim.value,
       status: claim.status,
+      submitted_reason: claim.submittedReason ?? null,
+      evidence_text: claim.evidenceText ?? null,
+      evidence_url: claim.evidenceUrl ?? null,
+      evidence_files: sanitizeEvidenceFiles(claim.evidenceFiles),
+      submitted_at: claim.submittedAt ?? null,
+      reviewer_id: claim.reviewerId ?? null,
+      reviewer_name: claim.reviewerName ?? null,
+      reviewed_at: claim.reviewedAt ?? null,
+      review_memo: claim.reviewMemo ?? null,
     })),
   );
 
@@ -2814,6 +2928,7 @@ function buildNormalizedRows(state, { includeSecrets = false } = {}) {
     created_at_text: report.createdAt,
     resolved_at_text: report.resolvedAt ?? null,
     resolved_by: report.resolvedBy ?? null,
+    evidence_files: sanitizeEvidenceFiles(report.evidenceFiles),
   }));
 
   const coin_ledger = state.ledger.map((item) => ({
@@ -3161,6 +3276,8 @@ const readinessLaunchMetadata = {
   process_lifecycle: { phase: "deploy", priority: "required", required: true },
   release_identity: { phase: "deploy", priority: "required", required: true },
   storage: { phase: "data", priority: "required", required: true },
+  evidence_storage: { phase: "data", priority: "required", required: true },
+  backup_retention: { phase: "data", priority: "required", required: true },
   oauth: { phase: "identity", priority: "required", required: true },
   sms: { phase: "identity", priority: "required", required: true },
   ai_judge: { phase: "trust", priority: "required", required: true },
@@ -3187,6 +3304,8 @@ const launchEnvByReadinessCheck = {
     "RELEASE_BUILD_TIME=<iso-build-time>",
   ],
   storage: ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_STORAGE_MODE=normalized"],
+  evidence_storage: ["SUPABASE_EVIDENCE_FILE_BUCKET=evidence-files", "EVIDENCE_FILE_MAX_BYTES=1500000"],
+  backup_retention: ["MAX_AUDIT_LOGS=300", "SUPABASE_STORAGE_MODE=normalized"],
   oauth: ["VITE_SUPABASE_URL", "VITE_SUPABASE_ANON_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"],
   sms: ["SMS_PROVIDER=solapi", "SOLAPI_API_KEY", "SOLAPI_API_SECRET", "SOLAPI_SENDER_NUMBER", "PHONE_CODE_HIDE_DEBUG=true"],
   ai_judge: ["OPENAI_API_KEY", "OPENAI_JUDGE_MODEL=gpt-4o-mini", "OPENAI_JUDGE_TIMEOUT_MS=20000", "AI_JUDGE_FORCE_LOCAL=false"],
@@ -3202,6 +3321,7 @@ const launchEnvByReadinessCheck = {
     "RATE_LIMIT_LOGIN_MAX=8",
     "RATE_LIMIT_PHONE_REQUEST_MAX=5",
     "RATE_LIMIT_MESSAGE_MAX=30",
+    "RATE_LIMIT_AI_JUDGE_MAX=6",
   ],
   origins: ["API_HOST=0.0.0.0", "ALLOWED_ORIGINS=https://your-service.example.com"],
   static_app: ["SERVE_STATIC_APP=true"],
@@ -3232,6 +3352,22 @@ const launchEnvTemplateByReadinessCheck = {
       "SUPABASE_SERVICE_ROLE_KEY=replace-with-service-role-key",
       "SUPABASE_TABLE_PREFIX=nb_",
       "SUPABASE_STORAGE_MODE=normalized",
+    ],
+  },
+  evidence_storage: {
+    title: "Evidence file storage",
+    lines: [
+      "SUPABASE_EVIDENCE_FILE_BUCKET=evidence-files",
+      "EVIDENCE_FILE_MAX_BYTES=1500000",
+      "EVIDENCE_FILE_ALLOWED_MIME_TYPES=image/png,image/jpeg,image/webp,application/pdf,text/plain",
+    ],
+  },
+  backup_retention: {
+    title: "Backup and retention",
+    lines: [
+      "MAX_AUDIT_LOGS=300",
+      "SUPABASE_STORAGE_MODE=normalized",
+      "# Follow README.md backup/recovery rehearsal before launch.",
     ],
   },
   oauth: {
@@ -3285,6 +3421,7 @@ const launchEnvTemplateByReadinessCheck = {
       "RATE_LIMIT_WRITE_WINDOW_SECONDS=60",
       "RATE_LIMIT_MESSAGE_MAX=30",
       "RATE_LIMIT_REPORT_MAX=10",
+      "RATE_LIMIT_AI_JUDGE_MAX=6",
     ],
   },
   origins: {
@@ -4116,6 +4253,7 @@ function buildLaunchReadiness(checks, summary) {
 
 function buildOperationalReadiness(payload) {
   const storage = storagePayload();
+  const evidenceStorage = evidenceStoragePayload();
   const runtime = runtimePayload();
   const smsStatus = getSmsProviderStatus();
   const aiStatus = getAiJudgeStatus();
@@ -4139,7 +4277,10 @@ function buildOperationalReadiness(payload) {
     rateLimits.phoneVerifyMax > 0 &&
     rateLimits.passwordMax > 0 &&
     rateLimits.messageMax > 0 &&
-    rateLimits.reportMax > 0;
+    rateLimits.reportMax > 0 &&
+    rateLimits.aiJudgeMax > 0;
+  const rateLimitWarnings = rateLimits.warnings ?? [];
+  const abuseLimitsStatus = abuseLimitsReady ? (rateLimitWarnings.length > 0 ? "warning" : "ready") : "blocked";
   const localOrigins = allowedOrigins.filter((origin) => /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin));
   const externalOrigins = allowedOrigins.filter((origin) => !localOrigins.includes(origin));
   const hasExplicitAllowedOrigins = Boolean(process.env.ALLOWED_ORIGINS?.trim());
@@ -4164,6 +4305,27 @@ function buildOperationalReadiness(payload) {
   const storageAction = storage.productionReady
     ? ""
     : "Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_ANON_KEY, SUPABASE_STORAGE_MODE=normalized, run supabase/normalized-schema.sql, then call /api/admin/storage-check.";
+  const evidenceStorageStatus = evidenceStorage.productionReady ? "ready" : IS_PRODUCTION_RUNTIME ? "blocked" : "warning";
+  const evidenceStorageDetail = evidenceStorage.productionReady
+    ? `증빙 파일 Storage bucket "${evidenceStorage.bucket}"가 ${evidenceStorage.maxBytes} byte 제한과 ${evidenceStorage.allowedMimeTypes.length}개 MIME allowlist로 설정되어 있습니다.`
+    : `Evidence file storage is not production-ready: ${evidenceStorage.missingEnv.join(", ") || "unknown"}.`;
+  const evidenceStorageAction = evidenceStorage.productionReady
+    ? ""
+    : "Set SUPABASE_EVIDENCE_FILE_BUCKET, EVIDENCE_FILE_MAX_BYTES, and EVIDENCE_FILE_ALLOWED_MIME_TYPES after configuring Supabase Storage.";
+  const auditLogCount = jsonArray(payload?.state?.auditLogs).length;
+  const auditRetentionPercent = Math.round((auditLogCount / MAX_AUDIT_LOGS) * 100);
+  const auditRetentionNearLimit = auditLogCount >= Math.floor(MAX_AUDIT_LOGS * 0.8);
+  const auditRetentionAtLimit = auditLogCount >= MAX_AUDIT_LOGS;
+  const backupRetentionStatus = auditRetentionAtLimit ? "blocked" : auditRetentionNearLimit || !storage.productionReady ? "warning" : "ready";
+  const backupRetentionDetail =
+    `README backup runbook is documented. App-state export, secure backup validation, restore rehearsal, and audit export are available; internal exports do not replace Supabase database backups. Audit logs ${auditLogCount}/${MAX_AUDIT_LOGS} (${auditRetentionPercent}%) retained.`;
+  const backupRetentionAction = auditRetentionAtLimit
+    ? "Export audit logs now, increase MAX_AUDIT_LOGS if needed, and confirm Supabase backup/PITR coverage before more admin work."
+    : auditRetentionNearLimit
+      ? "Export audit logs before they roll off and review MAX_AUDIT_LOGS plus Supabase backup coverage."
+      : storage.productionReady
+        ? ""
+        : "Move production storage to Supabase normalized mode and follow README.md backup/recovery rehearsal before launch.";
   const smsReadinessStatus = smsStatus.productionReady ? "ready" : IS_PRODUCTION_RUNTIME ? "blocked" : smsConfigured ? "warning" : "blocked";
   const smsReadinessDetail = smsStatus.productionReady
     ? "SOLAPI SMS is configured and debug verification codes are hidden."
@@ -4212,6 +4374,20 @@ function buildOperationalReadiness(payload) {
       storageAction,
     ),
     createReadinessItem(
+      "evidence_storage",
+      "증빙 파일 Storage",
+      evidenceStorageStatus,
+      evidenceStorageDetail,
+      evidenceStorageAction,
+    ),
+    createReadinessItem(
+      "backup_retention",
+      "백업/복구와 보존",
+      backupRetentionStatus,
+      backupRetentionDetail,
+      backupRetentionAction,
+    ),
+    createReadinessItem(
       "oauth",
       "간편 로그인 OAuth",
       storage.supabaseConfigured && SUPABASE_ANON_KEY ? "ready" : storage.supabaseConfigured ? "warning" : "blocked",
@@ -4252,13 +4428,15 @@ function buildOperationalReadiness(payload) {
     createReadinessItem(
       "abuse_limits",
       "Auth/SMS 남용 방지",
-      abuseLimitsReady ? "ready" : "blocked",
+      abuseLimitsStatus,
       abuseLimitsReady
-        ? `로그인 ${rateLimits.loginMax}회/${rateLimits.authWindowSeconds}초, SMS 요청 ${rateLimits.phoneRequestMax}회/${rateLimits.authWindowSeconds}초, 메시지 ${rateLimits.messageMax}회/${rateLimits.writeWindowSeconds}초 제한이 적용됩니다.`
+        ? `로그인 ${rateLimits.loginMax}회/${rateLimits.authWindowSeconds}초, SMS 요청 ${rateLimits.phoneRequestMax}회/${rateLimits.authWindowSeconds}초, 메시지 ${rateLimits.messageMax}회/${rateLimits.writeWindowSeconds}초, AI 판정 ${rateLimits.aiJudgeMax}회/${rateLimits.authWindowSeconds}초 제한이 적용됩니다.${rateLimitWarnings.length > 0 ? ` 운영 경고: ${rateLimitWarnings.join(", ")}` : ""}`
         : "인증, SMS, 메시지/신고 rate limit 값 중 0 이하인 항목이 있어 남용 방어가 비활성화될 수 있습니다.",
-      abuseLimitsReady
+      abuseLimitsReady && rateLimitWarnings.length === 0
         ? ""
-        : "RATE_LIMIT_* 환경변수를 양수로 설정하고 /api/health의 runtime.rateLimits를 확인하세요.",
+        : abuseLimitsReady
+          ? "운영 환경의 RATE_LIMIT_* 값을 권장선 이하로 낮추고 /api/health의 runtime.rateLimits.warnings를 확인하세요."
+          : "RATE_LIMIT_* 환경변수를 양수로 설정하고 /api/health의 runtime.rateLimits를 확인하세요.",
     ),
     createReadinessItem(
       "security_headers",
@@ -4370,6 +4548,7 @@ app.get("/api/health", (_request, response) => {
     smsProvider: SMS_PROVIDER,
     smsConfigured: isSmsProviderConfigured(),
     phoneDebugCodeExposed: EXPOSE_PHONE_DEBUG_CODE,
+    monitoring: monitoringPayload(),
     runtime: runtimePayload(),
     ...storagePayload(),
     now: new Date().toISOString(),
@@ -5368,6 +5547,59 @@ app.post("/api/admin/users/:userId/claims/:claimId/verify", async (request, resp
   }
 });
 
+app.post("/api/evidence-files", async (request, response, next) => {
+  try {
+    const payload = await readState();
+    if (!payload?.state) {
+      errorResponse(response, 409, "state_not_ready");
+      return;
+    }
+    const actorId = String(request.body?.actorId ?? "");
+    const ownerType = String(request.body?.ownerType ?? "evidence").trim().slice(0, 40);
+    const ownerId = String(request.body?.ownerId ?? "item").trim().slice(0, 120);
+    const actor = findStateUser(payload.state, actorId);
+    if (!actor) {
+      errorResponse(response, 404, "user_not_found");
+      return;
+    }
+    if (!ensureUserCanInteract(response, payload.state, actor)) return;
+    if (!["claim", "report", "ai_appeal"].includes(ownerType)) {
+      errorResponse(response, 400, "invalid_evidence_owner");
+      return;
+    }
+    if (
+      !consumeRateLimit(request, response, {
+        scope: "evidence_file_upload",
+        keyParts: [actor.id, ownerType],
+        max: RATE_LIMIT_REPORT_MAX,
+        windowSeconds: RATE_LIMIT_AUTH_WINDOW_SECONDS,
+      })
+    ) return;
+    const upload = await uploadEvidenceFile({
+      actorId: actor.id,
+      ownerType,
+      ownerId,
+      fileName: request.body?.fileName,
+      dataUrl: request.body?.dataUrl,
+    });
+    if (!upload.ok) {
+      errorResponse(response, 400, upload.error);
+      return;
+    }
+    response.json({
+      ok: true,
+      file: upload.file,
+      limits: {
+        maxBytes: MAX_EVIDENCE_FILE_BYTES,
+        allowedMimeTypes: EVIDENCE_FILE_ALLOWED_MIME_TYPES,
+        bucket: EVIDENCE_FILE_BUCKET,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/admin/reports/:reportId/resolve", async (request, response, next) => {
   try {
     const payload = await readState();
@@ -5650,6 +5882,7 @@ app.post("/api/users/:userId/claims/:claimId/request-verification", async (reque
     const submittedReason = sanitizeClaimText(request.body?.reason, 300);
     const evidenceText = sanitizeClaimText(request.body?.evidenceText, 1000);
     const evidenceUrl = sanitizeClaimEvidenceUrl(request.body?.evidenceUrl);
+    const evidenceFiles = sanitizeEvidenceFiles(request.body?.evidenceFiles);
     const targetUserId = String(request.params.userId ?? "");
     const claimId = String(request.params.claimId ?? "");
     const actor = findStateUser(payload.state, actorId);
@@ -5695,6 +5928,7 @@ app.post("/api/users/:userId/claims/:claimId/request-verification", async (reque
                       submittedReason,
                       evidenceText,
                       evidenceUrl,
+                      evidenceFiles,
                       submittedAt,
                       reviewerId: "",
                       reviewerName: "",
@@ -6395,12 +6629,38 @@ function sanitizeClaimEvidenceUrl(value) {
   }
 }
 
+function sanitizeEvidenceFileReference(file) {
+  if (!file || typeof file !== "object") return null;
+  const url = sanitizeClaimEvidenceUrl(file.url);
+  const path = sanitizeClaimText(file.path, 500);
+  const bucket = sanitizeClaimText(file.bucket, 120);
+  const mimeType = sanitizeClaimText(file.mimeType, 120);
+  const name = sanitizeClaimText(file.name, 180);
+  const uploadedAt = sanitizeClaimText(file.uploadedAt, 64);
+  const size = Number(file.size);
+  if (!url || url === null || !path || !bucket) return null;
+  return {
+    url,
+    path,
+    bucket,
+    name: name || path.split("/").pop() || "evidence-file",
+    mimeType,
+    size: Number.isFinite(size) && size > 0 ? Math.round(size) : 0,
+    uploadedAt,
+  };
+}
+
+function sanitizeEvidenceFiles(files) {
+  return jsonArray(files).map(sanitizeEvidenceFileReference).filter(Boolean).slice(0, 5);
+}
+
 function sanitizeClaimReviewMetadata(source) {
   const evidenceUrl = sanitizeClaimEvidenceUrl(source?.evidenceUrl);
   return {
     submittedReason: sanitizeClaimText(source?.submittedReason, 300),
     evidenceText: sanitizeClaimText(source?.evidenceText, 1000),
     evidenceUrl: evidenceUrl ?? "",
+    evidenceFiles: sanitizeEvidenceFiles(source?.evidenceFiles),
     submittedAt: sanitizeClaimText(source?.submittedAt, 64),
     reviewerId: sanitizeClaimText(source?.reviewerId, 64),
     reviewerName: sanitizeClaimText(source?.reviewerName, 80),
@@ -6434,6 +6694,7 @@ function sanitizeProfileClaims(nextClaims, previousClaims, { preserveSubmittedSt
             ...previous,
             evidenceText: claim?.evidenceText ?? previous?.evidenceText,
             evidenceUrl: claim?.evidenceUrl ?? previous?.evidenceUrl,
+            evidenceFiles: claim?.evidenceFiles ?? previous?.evidenceFiles,
           }
         : claim;
       const reviewMetadata = sanitizeClaimReviewMetadata(metadataSource);
@@ -6449,6 +6710,87 @@ function sanitizeProfileClaims(nextClaims, previousClaims, { preserveSubmittedSt
     })
     .filter(Boolean)
     .slice(0, 12);
+}
+
+function extensionForEvidenceMime(mimeType) {
+  return {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "application/pdf": "pdf",
+    "text/plain": "txt",
+  }[mimeType];
+}
+
+function sanitizeStorageFileName(value, fallback = "evidence") {
+  return String(value ?? fallback)
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .slice(0, 120) || fallback;
+}
+
+async function uploadEvidenceFile({ actorId, ownerType, ownerId, fileName, dataUrl }) {
+  const value = String(dataUrl ?? "").trim();
+  const match = value.match(/^data:([^;,]+);base64,([A-Za-z0-9+/=]+)$/);
+  if (!match) return { ok: false, error: "invalid_evidence_file" };
+  const mimeType = match[1] === "image/jpg" ? "image/jpeg" : match[1].toLowerCase();
+  if (!EVIDENCE_FILE_ALLOWED_MIME_TYPES.includes(mimeType)) {
+    return { ok: false, error: "unsupported_evidence_file_type" };
+  }
+  const bytes = Buffer.from(match[2], "base64");
+  if (!bytes.length) return { ok: false, error: "invalid_evidence_file" };
+  if (bytes.length > MAX_EVIDENCE_FILE_BYTES) {
+    return { ok: false, error: "evidence_file_too_large" };
+  }
+  if (!supabase) return { ok: false, error: "evidence_storage_not_configured" };
+
+  const extension = extensionForEvidenceMime(mimeType);
+  if (!extension) return { ok: false, error: "unsupported_evidence_file_type" };
+
+  try {
+    const bucketResult = await supabase.storage.createBucket(EVIDENCE_FILE_BUCKET, {
+      public: false,
+      fileSizeLimit: MAX_EVIDENCE_FILE_BYTES,
+      allowedMimeTypes: EVIDENCE_FILE_ALLOWED_MIME_TYPES,
+    });
+    if (
+      bucketResult.error &&
+      !String(bucketResult.error.message ?? "").toLowerCase().includes("already exists")
+    ) {
+      throw bucketResult.error;
+    }
+    const safeOwnerType = sanitizeStorageFileName(ownerType, "evidence");
+    const safeOwnerId = sanitizeStorageFileName(ownerId, "item");
+    const safeFileName = sanitizeStorageFileName(fileName, `evidence.${extension}`);
+    const storagePath = `${safeOwnerType}/${safeOwnerId}/${actorId}/${Date.now()}-${uid("file")}-${safeFileName}`;
+    const { error: uploadError } = await supabase.storage
+      .from(EVIDENCE_FILE_BUCKET)
+      .upload(storagePath, bytes, {
+        contentType: mimeType,
+        upsert: false,
+      });
+    if (uploadError) throw uploadError;
+    const { data, error: signedUrlError } = await supabase.storage
+      .from(EVIDENCE_FILE_BUCKET)
+      .createSignedUrl(storagePath, 60 * 60 * 24 * 7);
+    if (signedUrlError) throw signedUrlError;
+    return {
+      ok: true,
+      file: {
+        url: data?.signedUrl ?? "",
+        path: storagePath,
+        bucket: EVIDENCE_FILE_BUCKET,
+        name: String(fileName ?? safeFileName).trim().slice(0, 180) || safeFileName,
+        mimeType,
+        size: bytes.length,
+        uploadedAt: new Date().toISOString(),
+      },
+    };
+  } catch (error) {
+    console.warn("Evidence file upload failed:", error?.message ?? error);
+    return { ok: false, error: "evidence_file_upload_failed" };
+  }
 }
 
 async function resolveProfilePhotoUrl(userId, photoUrl) {
@@ -7531,6 +7873,7 @@ app.post("/api/reports", async (request, response, next) => {
     const targetId = String(request.body?.targetId ?? "");
     const channelId = request.body?.channelId ? String(request.body.channelId) : undefined;
     const rawReason = String(request.body?.reason ?? "").trim();
+    const evidenceFiles = sanitizeEvidenceFiles(request.body?.evidenceFiles);
     if (
       !consumeRateLimit(request, response, {
         scope: "report_create",
@@ -7585,6 +7928,7 @@ app.post("/api/reports", async (request, response, next) => {
       assigneeName: "",
       assignedAt: "",
       reviewMemo: "",
+      evidenceFiles,
       statusHistory: [
         {
           status: "open",
@@ -8639,6 +8983,7 @@ app.post("/api/debate/:channelId/appeals", async (request, response, next) => {
     const channelId = String(request.params.channelId ?? "");
     const userId = String(request.body?.userId ?? "");
     const reason = String(request.body?.reason ?? "").trim().slice(0, 500);
+    const evidenceFiles = sanitizeEvidenceFiles(request.body?.evidenceFiles);
     const user = findStateUser(payload.state, userId);
     const channel = findStateChannel(payload.state, channelId);
     if (!user) {
@@ -8677,6 +9022,7 @@ app.post("/api/debate/:channelId/appeals", async (request, response, next) => {
       reason,
       status: "pending",
       createdAt: nowLabel(),
+      evidenceFiles,
     });
     const nextState = notifyPlatformManagers({
       ...payload.state,
@@ -8772,6 +9118,14 @@ app.post("/api/ai/judge", async (request, response, next) => {
   const channelId = String(request.body?.channelId ?? "");
   try {
     const userId = String(request.body?.userId ?? "");
+    if (
+      !consumeRateLimit(request, response, {
+        scope: "ai_judge",
+        keyParts: [userId || "anonymous"],
+        max: RATE_LIMIT_AI_JUDGE_MAX,
+        windowSeconds: RATE_LIMIT_AUTH_WINDOW_SECONDS,
+      })
+    ) return;
     const payload = await readState();
     if (!payload?.state) {
       errorResponse(response, 409, "state_not_ready");
@@ -9066,8 +9420,13 @@ if (SERVE_STATIC_APP) {
   });
 }
 
-app.use((error, _request, response, _next) => {
-  console.error(error);
+app.use((error, request, response, _next) => {
+  console.error("API request failed", {
+    ...operationalLogContext(),
+    ...errorLogSummary(error),
+    method: request.method,
+    path: request.path,
+  });
   if (error?.type === "entity.parse.failed") {
     response.status(400).json({ error: "invalid_json" });
     return;
@@ -9254,6 +9613,7 @@ async function requestShutdown(reason, exitCode = 0) {
   shuttingDown = true;
   shutdownStartedAt = new Date().toISOString();
   console.log("Nosu Best API shutdown requested", {
+    ...operationalLogContext(),
     reason,
     shutdownStartedAt,
     shutdownGraceMs: SHUTDOWN_GRACE_MS,
@@ -9263,13 +9623,17 @@ async function requestShutdown(reason, exitCode = 0) {
     debateClockTimer = null;
   }
   const forceExit = setTimeout(() => {
-    console.error("Nosu Best API shutdown timed out", { reason, shutdownGraceMs: SHUTDOWN_GRACE_MS });
+    console.error("Nosu Best API shutdown timed out", {
+      ...operationalLogContext(),
+      reason,
+      shutdownGraceMs: SHUTDOWN_GRACE_MS,
+    });
     process.exit(1);
   }, SHUTDOWN_GRACE_MS);
   forceExit.unref?.();
   await Promise.all([closeSocketServer(), closeHttpServer()]);
   clearTimeout(forceExit);
-  console.log("Nosu Best API shutdown complete", { reason });
+  console.log("Nosu Best API shutdown complete", { ...operationalLogContext(), reason });
   process.exit(exitCode);
 }
 
@@ -9288,12 +9652,12 @@ process.on("message", (message) => {
 });
 
 process.on("uncaughtException", (error) => {
-  console.error("Uncaught exception:", error);
+  console.error("Uncaught exception", { ...operationalLogContext(), ...errorLogSummary(error) });
   void requestShutdown("uncaughtException", 1);
 });
 
 process.on("unhandledRejection", (error) => {
-  console.error("Unhandled rejection:", error);
+  console.error("Unhandled rejection", { ...operationalLogContext(), ...errorLogSummary(error) });
   void requestShutdown("unhandledRejection", 1);
 });
 
@@ -9301,6 +9665,7 @@ httpServer.listen(PORT, API_HOST, () => {
   console.log(`Nosu Best API running at http://${API_HOST}:${PORT}`);
   console.log(`Realtime: Socket.IO enabled`);
   console.log(`Allowed origins: ${allowedOrigins.join(", ")}`);
+  console.log("Runtime:", operationalLogContext());
   console.log(
     `Storage: ${
       usesNormalizedSupabase

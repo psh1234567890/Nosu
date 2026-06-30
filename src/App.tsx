@@ -75,6 +75,17 @@ type ProfileFrame = "clean" | "solid" | "glow";
 type ProfileBanner = "plain" | "gradient" | "midnight";
 type ServiceNoticeTone = "info" | "warning" | "critical";
 type ServiceNoticeDuration = "manual" | "1h" | "4h" | "24h" | "72h";
+type EvidenceOwnerType = "claim" | "report" | "ai_appeal";
+
+interface EvidenceFileReference {
+  url: string;
+  path: string;
+  bucket: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  uploadedAt: string;
+}
 
 interface ProfileClaim {
   id: string;
@@ -84,6 +95,7 @@ interface ProfileClaim {
   submittedReason?: string;
   evidenceText?: string;
   evidenceUrl?: string;
+  evidenceFiles?: EvidenceFileReference[];
   submittedAt?: string;
   reviewerId?: string;
   reviewerName?: string;
@@ -95,6 +107,7 @@ interface ClaimRequestDraft {
   reason: string;
   evidenceText: string;
   evidenceUrl: string;
+  evidenceFiles: EvidenceFileReference[];
 }
 
 interface UserStats {
@@ -116,6 +129,8 @@ interface UserAgreementState {
   };
   updatedAt?: string;
 }
+
+type PolicyDocumentKey = keyof UserAgreementState["documents"];
 
 interface User {
   id: string;
@@ -307,6 +322,7 @@ interface ReportRecord {
   assigneeName?: string;
   assignedAt?: string;
   reviewMemo?: string;
+  evidenceFiles?: EvidenceFileReference[];
   statusHistory?: {
     status: ReportStatus;
     actorId: string;
@@ -328,6 +344,7 @@ interface AiAppealRecord {
   reviewerId?: string;
   reviewerName?: string;
   reviewMemo?: string;
+  evidenceFiles?: EvidenceFileReference[];
 }
 
 interface UserSanction {
@@ -465,8 +482,14 @@ type PhoneCodeResult = AuthResult & {
   smsSent?: boolean;
   smsDeliveryId?: string;
 };
+type ApiErrorPayload = {
+  error?: string;
+  retryAfterSeconds?: number;
+  resendAfterSeconds?: number;
+};
 type ActionResult = { ok: boolean; message?: string };
 type ChannelActionResult = ActionResult & { channelId?: string; roomId?: string };
+type EvidenceUploadResult = ActionResult & { file?: EvidenceFileReference };
 type RealtimeStatus = "connecting" | "live" | "offline";
 type PublicServiceStatusLevel = "operational" | "degraded" | "maintenance";
 type LedgerFilter = "all" | "income" | "spending" | "debate" | "shop" | "admin";
@@ -846,10 +869,12 @@ interface RateLimitRuntime {
   passwordMax: number;
   messageMax: number;
   reportMax: number;
+  aiJudgeMax: number;
   phoneCodeTtlSeconds: number;
   phoneCodeResendSeconds: number;
   phoneCodeMaxAttempts: number;
   activeBuckets: number;
+  warnings?: string[];
 }
 interface ProviderDiagnosticsRuntime {
   sms: {
@@ -1126,6 +1151,12 @@ const channelErrorMessages: Record<string, string> = {
   invalid_claim_status: "인증 상태를 다시 확인해주세요.",
   missing_claim_reason: "인증 요청 사유를 입력해주세요.",
   invalid_claim_evidence: "증빙 URL은 http 또는 https 주소만 사용할 수 있습니다.",
+  invalid_evidence_owner: "증빙 파일을 연결할 대상을 다시 확인해주세요.",
+  invalid_evidence_file: "증빙 파일 형식을 다시 확인해주세요.",
+  unsupported_evidence_file_type: "지원하지 않는 증빙 파일 형식입니다.",
+  evidence_file_too_large: "증빙 파일 용량이 너무 큽니다.",
+  evidence_storage_not_configured: "증빙 파일 저장소가 아직 설정되지 않았습니다.",
+  evidence_file_upload_failed: "증빙 파일 업로드에 실패했습니다. 잠시 후 다시 시도해주세요.",
   missing_review_memo: "반려하려면 심사 메모를 입력해주세요.",
   claim_not_found: "인증 항목을 찾을 수 없습니다.",
   report_not_found: "신고 항목을 찾을 수 없습니다.",
@@ -1147,6 +1178,24 @@ const channelErrorMessages: Record<string, string> = {
   invalid_service_notice: "공지 제목과 본문을 입력해주세요.",
   invalid_platform_settings: "운영 정책 설정 범위를 다시 확인해주세요.",
 };
+
+function formatRetryAfterNotice(payload: ApiErrorPayload, response?: Response) {
+  const rawSeconds = payload.retryAfterSeconds ?? payload.resendAfterSeconds ?? response?.headers.get("Retry-After") ?? 0;
+  const seconds = Number(rawSeconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  return `${Math.max(1, Math.ceil(seconds)).toLocaleString()}초 후 다시 시도해주세요.`;
+}
+
+function formatApiErrorMessage(
+  payload: ApiErrorPayload,
+  messages: Record<string, string>,
+  fallbackMessage: string,
+  response?: Response,
+) {
+  const baseMessage = messages[payload.error ?? ""] ?? fallbackMessage;
+  const retryNotice = formatRetryAfterNotice(payload, response);
+  return retryNotice ? `${baseMessage} ${retryNotice}` : baseMessage;
+}
 
 const providerLabels: Record<Provider, string> = {
   local: "아이디",
@@ -1219,6 +1268,37 @@ const aiAppealStatusLabels: Record<AiAppealStatus, string> = {
   dismissed: "기각",
 };
 
+function formatEvidenceFileSize(size: number) {
+  if (!Number.isFinite(size) || size <= 0) return "";
+  if (size < 1024) return `${size}B`;
+  if (size < 1024 * 1024) return `${Math.round(size / 1024)}KB`;
+  return `${(size / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error ?? new Error("file_read_failed"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function EvidenceFileLinks({ files }: { files?: EvidenceFileReference[] }) {
+  const safeFiles = files?.filter((file) => file.url) ?? [];
+  if (safeFiles.length === 0) return null;
+  return (
+    <>
+      {safeFiles.map((file) => (
+        <a className="claim-review-note" href={file.url} target="_blank" rel="noreferrer" key={file.path || file.url}>
+          증빙 파일 열기: {file.name || "파일"}
+          {file.size ? ` (${formatEvidenceFileSize(file.size)})` : ""}
+        </a>
+      ))}
+    </>
+  );
+}
+
 const privacyRequestStatusLabels: Record<PrivacyRequestStatus, string> = {
   pending: "접수",
   reviewing: "검토중",
@@ -1266,6 +1346,43 @@ const requiredAgreementDocuments = {
   privacy: "privacy-2026-06-28",
   community: "community-rules-2026-06-28",
 };
+const policyDocumentLinks = [
+  {
+    key: "terms",
+    label: "서비스 이용약관",
+    href: "/policies/terms.html",
+    version: requiredAgreementDocuments.terms,
+    replacementPath: "public/policies/terms.html",
+  },
+  {
+    key: "privacy",
+    label: "개인정보 처리방침",
+    href: "/policies/privacy.html",
+    version: requiredAgreementDocuments.privacy,
+    replacementPath: "public/policies/privacy.html",
+  },
+  {
+    key: "community",
+    label: "커뮤니티 규칙",
+    href: "/policies/community.html",
+    version: requiredAgreementDocuments.community,
+    replacementPath: "public/policies/community.html",
+  },
+] satisfies Array<{
+  key: PolicyDocumentKey;
+  label: string;
+  href: string;
+  version: string;
+  replacementPath: string;
+}>;
+const policyDocumentByKey = Object.fromEntries(
+  policyDocumentLinks.map((document) => [document.key, document]),
+) as Record<PolicyDocumentKey, (typeof policyDocumentLinks)[number]>;
+const policyDocumentReview = {
+  readinessCheckId: "policy_documents",
+  placeholderCopyPresent: true,
+  replacementLocation: "public/policies/*.html",
+};
 const AUDIT_LOG_RETENTION_LIMIT = 300;
 const AUDIT_LOG_RENDER_LIMIT = 40;
 
@@ -1299,6 +1416,60 @@ const normalizeAgreementState = (agreement?: Partial<UserAgreementState> | null)
 
 const hasRequiredAgreements = (user?: User | null) =>
   Boolean(user && normalizeAgreementState(user.agreements).requiredAccepted);
+
+function formatAcceptedAgreementVersion(agreement?: Partial<UserAgreementState> | null) {
+  if (!agreement) return "legacy";
+  return agreement.requiredVersion || "기록 없음";
+}
+
+function PolicyDocumentLinks({
+  agreement,
+  showAcceptedStatus = false,
+  heading = "정책 문서",
+}: {
+  agreement?: Partial<UserAgreementState> | null;
+  showAcceptedStatus?: boolean;
+  heading?: string;
+}) {
+  const normalizedAgreement = showAcceptedStatus ? normalizeAgreementState(agreement) : null;
+  return (
+    <div
+      className="session-status-card pending"
+      data-smoke="policy-document-links"
+      data-required-agreement-version={requiredAgreementVersion}
+      data-policy-readiness-id={policyDocumentReview.readinessCheckId}
+      data-policy-placeholder={policyDocumentReview.placeholderCopyPresent ? "true" : "false"}
+    >
+      <div className="session-status-main">
+        <span className="session-dot pending" aria-hidden />
+        <div>
+          <strong>{heading}</strong>
+          <small>필수 동의 버전 {requiredAgreementVersion} · 공개 문서 위치</small>
+        </div>
+      </div>
+      <div className="session-status-meta">
+        {policyDocumentLinks.map((document) => (
+          <span key={document.key}>
+            <Scale size={14} aria-hidden />
+            <a href={document.href} target="_blank" rel="noreferrer" data-policy-document={document.key}>
+              {document.label}
+            </a>
+            <em>{document.version}</em>
+          </span>
+        ))}
+      </div>
+      {showAcceptedStatus && (
+        <small className="claim-review-note">
+          내 동의: {normalizedAgreement?.requiredAccepted ? "최신 버전 수락" : "재동의 필요"} · 수락 버전{" "}
+          {formatAcceptedAgreementVersion(agreement)}
+        </small>
+      )}
+      <small className="claim-review-note">
+        운영 교체 위치: {policyDocumentReview.replacementLocation} · readiness hook {policyDocumentReview.readinessCheckId}
+      </small>
+    </div>
+  );
+}
 
 const accentOptions: Array<{ value: ProfileAccent; label: string }> = [
   { value: "blue", label: "토스 블루" },
@@ -2030,7 +2201,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: authErrorMessages[payload.error ?? ""] ?? "세션 확인에 실패했습니다.",
+          message: formatApiErrorMessage(payload, authErrorMessages, "세션 확인에 실패했습니다.", response),
           checkedAt: new Date().toISOString(),
         };
       }
@@ -2091,7 +2262,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: authErrorMessages[payload.error ?? ""] ?? fallbackMessage,
+          message: formatApiErrorMessage(payload, authErrorMessages, fallbackMessage, response),
         };
       }
       if (payload.state) {
@@ -2131,7 +2302,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: authErrorMessages[payload.error ?? ""] ?? "간편 로그인 세션 연결에 실패했습니다.",
+          message: formatApiErrorMessage(payload, authErrorMessages, "간편 로그인 세션 연결에 실패했습니다.", response),
         };
       }
       if (payload.state) replaceStateFromServer(payload.state);
@@ -2171,7 +2342,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: authErrorMessages[payload.error ?? ""] ?? "비밀번호 재설정 인증번호 요청에 실패했습니다.",
+          message: formatApiErrorMessage(payload, authErrorMessages, "비밀번호 재설정 인증번호 요청에 실패했습니다.", response),
           resendAfterSeconds: payload.resendAfterSeconds,
         };
       }
@@ -2249,7 +2420,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: channelErrorMessages[payload.error ?? ""] ?? fallbackMessage,
+          message: formatApiErrorMessage(payload, channelErrorMessages, fallbackMessage, response),
         };
       }
       if (payload.state) {
@@ -2283,7 +2454,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: channelErrorMessages[payload.error ?? ""] ?? fallbackMessage,
+          message: formatApiErrorMessage(payload, channelErrorMessages, fallbackMessage, response),
         };
       }
       if (payload.state) {
@@ -2317,7 +2488,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: channelErrorMessages[payload.error ?? ""] ?? fallbackMessage,
+          message: formatApiErrorMessage(payload, channelErrorMessages, fallbackMessage, response),
         };
       }
       if (payload.state) {
@@ -2351,7 +2522,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: channelErrorMessages[payload.error ?? ""] ?? fallbackMessage,
+          message: formatApiErrorMessage(payload, channelErrorMessages, fallbackMessage, response),
         };
       }
       if (payload.state) {
@@ -2364,6 +2535,42 @@ export default function App() {
     } catch {
       setBackendStatus("offline");
       return { ok: false, message: "유저 API에 연결할 수 없습니다. 서버를 확인해주세요." };
+    }
+  };
+
+  const uploadEvidenceFile = async (
+    file: File,
+    ownerType: EvidenceOwnerType,
+    ownerId: string,
+  ): Promise<EvidenceUploadResult> => {
+    if (!currentUser) return { ok: false, message: "로그인이 필요합니다." };
+    try {
+      setBackendStatus("saving");
+      const dataUrl = await readFileAsDataUrl(file);
+      const response = await fetch(`${API_BASE}/evidence-files`, {
+        method: "POST",
+        credentials: "include",
+        headers: jsonHeaders(),
+        body: JSON.stringify({
+          actorId: currentUser.id,
+          ownerType,
+          ownerId,
+          fileName: file.name,
+          dataUrl,
+        }),
+      });
+      const payload = (await response.json().catch(() => ({}))) as EvidenceUploadResult & { error?: string };
+      setBackendStatus("connected");
+      if (!response.ok || !payload.file) {
+        return {
+          ok: false,
+          message: formatApiErrorMessage(payload, channelErrorMessages, "증빙 파일 업로드에 실패했습니다.", response),
+        };
+      }
+      return { ok: true, file: payload.file };
+    } catch {
+      setBackendStatus("offline");
+      return { ok: false, message: "증빙 파일 업로드 API에 연결할 수 없습니다." };
     }
   };
 
@@ -2536,7 +2743,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: authErrorMessages[payload.error ?? ""] ?? "필수 약관 동의 저장에 실패했습니다.",
+          message: formatApiErrorMessage(payload, authErrorMessages, "필수 약관 동의 저장에 실패했습니다.", response),
         };
       }
       if (payload.state) replaceStateFromServer(payload.state, { preserveCurrentUser: true });
@@ -2564,7 +2771,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: authErrorMessages[payload.error ?? ""] ?? "인증번호 요청에 실패했습니다.",
+          message: formatApiErrorMessage(payload, authErrorMessages, "인증번호 요청에 실패했습니다.", response),
           resendAfterSeconds: payload.resendAfterSeconds,
         };
       }
@@ -2624,7 +2831,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: channelErrorMessages[payload.error ?? ""] ?? "내 데이터 다운로드에 실패했습니다.",
+          message: formatApiErrorMessage(payload, channelErrorMessages, "내 데이터 다운로드에 실패했습니다.", response),
         };
       }
       const filename = payload.filename || `nosu-best-user-data-${currentUser.id}-${new Date().toISOString().slice(0, 10)}.json`;
@@ -3148,11 +3355,12 @@ export default function App() {
     reason: string,
     evidenceText: string,
     evidenceUrl: string,
+    evidenceFiles: EvidenceFileReference[] = [],
   ): Promise<ActionResult> => {
     if (!currentUser) return Promise.resolve({ ok: false, message: "로그인이 필요합니다." });
     return runUserAction(
       `/users/${currentUser.id}/claims/${claimId}/request-verification`,
-      { actorId: currentUser.id, reason, evidenceText, evidenceUrl },
+      { actorId: currentUser.id, reason, evidenceText, evidenceUrl, evidenceFiles },
       "인증 요청에 실패했습니다.",
     );
   };
@@ -3389,22 +3597,27 @@ export default function App() {
     targetId: string,
     channelId: string | undefined,
     reason: string,
+    evidenceFiles: EvidenceFileReference[] = [],
   ): Promise<ChannelActionResult> => {
     if (!currentUser) return Promise.resolve({ ok: false, message: "로그인이 필요합니다." });
     const suspensionBlock = blockedBySuspension();
     if (suspensionBlock) return Promise.resolve(suspensionBlock);
     return runDebateAction(
       "/reports",
-      { userId: currentUser.id, targetType, targetId, channelId, reason },
+      { userId: currentUser.id, targetType, targetId, channelId, reason, evidenceFiles },
       "신고 접수에 실패했습니다.",
     );
   };
 
-  const submitAiAppeal = (channelId: string, reason: string): Promise<ActionResult> => {
+  const submitAiAppeal = (
+    channelId: string,
+    reason: string,
+    evidenceFiles: EvidenceFileReference[] = [],
+  ): Promise<ActionResult> => {
     if (!currentUser) return Promise.resolve({ ok: false, message: "로그인이 필요합니다." });
     return runUserAction(
       `/debate/${channelId}/appeals`,
-      { userId: currentUser.id, reason },
+      { userId: currentUser.id, reason, evidenceFiles },
       "AI 판정 이의제기 제출에 실패했습니다.",
     );
   };
@@ -3534,7 +3747,7 @@ export default function App() {
         setBackendStatus("connected");
         return {
           ok: false,
-          message: channelErrorMessages[payload.error ?? ""] ?? payload.error ?? "AI 판정에 실패했습니다.",
+          message: formatApiErrorMessage(payload, channelErrorMessages, payload.error ?? "AI 판정에 실패했습니다.", response),
         };
       }
       if (payload.state) replaceStateFromServer(payload.state, { preserveCurrentUser: true });
@@ -3806,6 +4019,7 @@ export default function App() {
           onSubmitReaction={submitReaction}
           onSubmitReport={submitReport}
           onSubmitAiAppeal={submitAiAppeal}
+          onUploadEvidenceFile={uploadEvidenceFile}
           onSubmitVote={submitVote}
           onFinalizeDebate={finalizeDebate}
           onDeleteChannel={deleteChannel}
@@ -3820,6 +4034,7 @@ export default function App() {
           privacyRequests={state.privacyRequests}
           onSave={saveUserProfile}
           onRequestClaimVerification={requestClaimVerification}
+          onUploadEvidenceFile={uploadEvidenceFile}
           onChangePhone={changeCurrentUserPhone}
           onChangePassword={changeCurrentUserPassword}
           onDeactivateAccount={deactivateCurrentUser}
@@ -4535,6 +4750,7 @@ function AuthView({
               </div>
             </>
           )}
+          <PolicyDocumentLinks heading="공개 정책 문서" />
         </section>
         <PublicServiceStatusCard
           status={serviceStatus}
@@ -4597,6 +4813,7 @@ function AgreementGate({
             {currentUser.displayName}님, 토론 입장과 코인 기능을 사용하기 전에 서비스 이용약관,
             개인정보 처리방침, 커뮤니티 규칙을 확인해주세요.
           </p>
+          <PolicyDocumentLinks heading="동의 문서 버전" agreement={currentUser.agreements} showAcceptedStatus />
           <form className="stack-form" onSubmit={submit}>
             <label>
               <input
@@ -4605,7 +4822,12 @@ function AgreementGate({
                 onChange={() => toggle("terms")}
                 data-smoke="agreement-terms"
               />
-              서비스 이용약관에 동의합니다.
+              <span>
+                <a href={policyDocumentByKey.terms.href} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
+                  서비스 이용약관
+                </a>
+                에 동의합니다. <small>{policyDocumentByKey.terms.version}</small>
+              </span>
             </label>
             <label>
               <input
@@ -4614,7 +4836,12 @@ function AgreementGate({
                 onChange={() => toggle("privacy")}
                 data-smoke="agreement-privacy"
               />
-              개인정보 처리방침에 동의합니다.
+              <span>
+                <a href={policyDocumentByKey.privacy.href} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
+                  개인정보 처리방침
+                </a>
+                에 동의합니다. <small>{policyDocumentByKey.privacy.version}</small>
+              </span>
             </label>
             <label>
               <input
@@ -4623,7 +4850,12 @@ function AgreementGate({
                 onChange={() => toggle("community")}
                 data-smoke="agreement-community"
               />
-              커뮤니티 규칙과 신고/제재 정책을 준수합니다.
+              <span>
+                <a href={policyDocumentByKey.community.href} target="_blank" rel="noreferrer" onClick={(event) => event.stopPropagation()}>
+                  커뮤니티 규칙
+                </a>
+                과 신고/제재 정책을 준수합니다. <small>{policyDocumentByKey.community.version}</small>
+              </span>
             </label>
             {message && <p className="form-error">{message}</p>}
             <button type="submit" disabled={!allChecked || saving} data-smoke="agreement-accept">
@@ -4813,6 +5045,7 @@ function ArenaView({
   onSubmitReaction,
   onSubmitReport,
   onSubmitAiAppeal,
+  onUploadEvidenceFile,
   onSubmitVote,
   onFinalizeDebate,
   onDeleteChannel,
@@ -4857,8 +5090,18 @@ function ArenaView({
     targetId: string,
     channelId: string | undefined,
     reason: string,
+    evidenceFiles?: EvidenceFileReference[],
   ) => Promise<ChannelActionResult>;
-  onSubmitAiAppeal: (channelId: string, reason: string) => Promise<ActionResult>;
+  onSubmitAiAppeal: (
+    channelId: string,
+    reason: string,
+    evidenceFiles?: EvidenceFileReference[],
+  ) => Promise<ActionResult>;
+  onUploadEvidenceFile: (
+    file: File,
+    ownerType: EvidenceOwnerType,
+    ownerId: string,
+  ) => Promise<EvidenceUploadResult>;
   onSubmitVote: (channelId: string, targetUserId: string) => Promise<ChannelActionResult>;
   onFinalizeDebate: (channelId: string) => Promise<ActionResult>;
   onDeleteChannel: (channelId: string) => Promise<ChannelActionResult>;
@@ -5126,10 +5369,11 @@ function ArenaView({
             onAddDebateMessage={(body) => onAddDebateMessage(selectedChannel.id, body)}
             onAddSpectatorMessage={(body) => onAddSpectatorMessage(selectedChannel.id, body)}
             onReact={(targetUserId) => onSubmitReaction(selectedChannel.id, targetUserId)}
-            onReport={(targetType, targetId, reason) =>
-              onSubmitReport(targetType, targetId, selectedChannel.id, reason)
+            onReport={(targetType, targetId, reason, evidenceFiles) =>
+              onSubmitReport(targetType, targetId, selectedChannel.id, reason, evidenceFiles)
             }
-            onSubmitAiAppeal={(reason) => onSubmitAiAppeal(selectedChannel.id, reason)}
+            onSubmitAiAppeal={(reason, evidenceFiles) => onSubmitAiAppeal(selectedChannel.id, reason, evidenceFiles)}
+            onUploadEvidenceFile={onUploadEvidenceFile}
             onVote={(targetUserId) => onSubmitVote(selectedChannel.id, targetUserId)}
             onFinalize={() => onFinalizeDebate(selectedChannel.id)}
             onDelete={() => onDeleteChannel(selectedChannel.id)}
@@ -5489,6 +5733,7 @@ function ChannelDetail({
   onReact,
   onReport,
   onSubmitAiAppeal,
+  onUploadEvidenceFile,
   onVote,
   onFinalize,
   onDelete,
@@ -5514,8 +5759,18 @@ function ChannelDetail({
   onAddDebateMessage: (body: string) => Promise<ActionResult>;
   onAddSpectatorMessage: (body: string) => Promise<ActionResult>;
   onReact: (targetUserId: string) => Promise<ActionResult>;
-  onReport: (targetType: ReportTargetType, targetId: string, reason: string) => Promise<ActionResult>;
-  onSubmitAiAppeal: (reason: string) => Promise<ActionResult>;
+  onReport: (
+    targetType: ReportTargetType,
+    targetId: string,
+    reason: string,
+    evidenceFiles?: EvidenceFileReference[],
+  ) => Promise<ActionResult>;
+  onSubmitAiAppeal: (reason: string, evidenceFiles?: EvidenceFileReference[]) => Promise<ActionResult>;
+  onUploadEvidenceFile: (
+    file: File,
+    ownerType: EvidenceOwnerType,
+    ownerId: string,
+  ) => Promise<EvidenceUploadResult>;
   onVote: (targetUserId: string) => Promise<ActionResult>;
   onFinalize: () => Promise<ActionResult>;
   onDelete: () => Promise<ActionResult>;
@@ -5531,6 +5786,9 @@ function ChannelDetail({
   const [nowMs, setNowMs] = useState(Date.now());
   const [actionError, setActionError] = useState("");
   const [judgeError, setJudgeError] = useState("");
+  const [reportEvidenceFiles, setReportEvidenceFiles] = useState<EvidenceFileReference[]>([]);
+  const [reportEvidenceMessage, setReportEvidenceMessage] = useState("");
+  const [reportEvidenceUploading, setReportEvidenceUploading] = useState(false);
   const [debateSending, setDebateSending] = useState(false);
   const [spectatorSending, setSpectatorSending] = useState(false);
   const debateListRef = useRef<HTMLDivElement | null>(null);
@@ -5543,6 +5801,33 @@ function ChannelDetail({
   const [newDebateCount, setNewDebateCount] = useState(0);
   const [newSpectatorCount, setNewSpectatorCount] = useState(0);
   const participants = channel.participantIds.map((id) => users.find((user) => user.id === id)).filter(Boolean) as User[];
+
+  const attachReportEvidence = async (file: File | null) => {
+    if (!file) return;
+    setReportEvidenceUploading(true);
+    setReportEvidenceMessage("");
+    const result = await onUploadEvidenceFile(file, "report", channel.id);
+    setReportEvidenceUploading(false);
+    if (!result.ok || !result.file) {
+      setReportEvidenceMessage(result.message ?? "신고 증빙 파일 업로드에 실패했습니다.");
+      return;
+    }
+    setReportEvidenceFiles((previous) => [...previous, result.file as EvidenceFileReference].slice(-3));
+    setReportEvidenceMessage("다음 신고에 증빙 파일이 첨부됩니다.");
+  };
+
+  const submitReportWithEvidence = async (
+    targetType: ReportTargetType,
+    targetId: string,
+    reason: string,
+  ) => {
+    const result = await onReport(targetType, targetId, reason, reportEvidenceFiles);
+    if (result.ok) {
+      setReportEvidenceFiles([]);
+      setReportEvidenceMessage("");
+    }
+    return result;
+  };
   const allParticipantsReady =
     participants.length === channel.participantLimit &&
     channel.participantIds.every((participantId) => (channel.readyUserIds ?? []).includes(participantId));
@@ -5621,6 +5906,8 @@ function ChannelDetail({
       spectatorAtBottomRef.current = true;
       setNewDebateCount(0);
       setNewSpectatorCount(0);
+      setReportEvidenceFiles([]);
+      setReportEvidenceMessage("");
       window.requestAnimationFrame(() => {
         scrollToListBottom(debateListRef.current);
         scrollToListBottom(spectatorListRef.current);
@@ -5801,11 +6088,29 @@ function ChannelDetail({
         className="report-button"
         type="button"
         onClick={() => {
-          void runControlAction(() => onReport("channel", channel.id, "채널 신고"), "신고 접수에 실패했습니다.");
+          void runControlAction(() => submitReportWithEvidence("channel", channel.id, "채널 신고"), "신고 접수에 실패했습니다.");
         }}
       >
         채널 신고
       </button>
+      <label className="storage-file-action">
+        <ImageUp size={15} aria-hidden />
+        {reportEvidenceUploading ? "증빙 업로드 중" : "신고 증빙 첨부"}
+        <input
+          type="file"
+          accept="image/png,image/jpeg,image/webp,application/pdf,text/plain"
+          disabled={reportEvidenceUploading}
+          onChange={(event) => {
+            const file = event.currentTarget.files?.[0] ?? null;
+            void attachReportEvidence(file);
+            event.currentTarget.value = "";
+          }}
+        />
+      </label>
+      <EvidenceFileLinks files={reportEvidenceFiles} />
+      {reportEvidenceMessage && (
+        <p className={reportEvidenceFiles.length > 0 ? "form-success" : "form-error"}>{reportEvidenceMessage}</p>
+      )}
 
       {canManageChannel && (
         <div className="channel-admin-panel">
@@ -5957,6 +6262,7 @@ function ChannelDetail({
           currentUser={currentUser}
           aiAppeals={aiAppeals}
           onSubmitAiAppeal={onSubmitAiAppeal}
+          onUploadEvidenceFile={onUploadEvidenceFile}
         />
       )}
 
@@ -6015,7 +6321,7 @@ function ChannelDetail({
                       type="button"
                       onClick={() => {
                         void runControlAction(
-                          () => onReport("debate_message", message.id, "토론 발언 신고"),
+                          () => submitReportWithEvidence("debate_message", message.id, "토론 발언 신고"),
                           "신고 접수에 실패했습니다.",
                         );
                       }}
@@ -6144,7 +6450,7 @@ function ChannelDetail({
                   type="button"
                   onClick={() => {
                     void runControlAction(
-                      () => onReport("spectator_message", message.id, "관전 채팅 신고"),
+                      () => submitReportWithEvidence("spectator_message", message.id, "관전 채팅 신고"),
                       "신고 접수에 실패했습니다.",
                     );
                   }}
@@ -7072,6 +7378,7 @@ function ProfileView({
   privacyRequests,
   onSave,
   onRequestClaimVerification,
+  onUploadEvidenceFile,
   onChangePhone,
   onChangePassword,
   onDeactivateAccount,
@@ -7087,7 +7394,13 @@ function ProfileView({
     reason: string,
     evidenceText: string,
     evidenceUrl: string,
+    evidenceFiles?: EvidenceFileReference[],
   ) => Promise<ActionResult>;
+  onUploadEvidenceFile: (
+    file: File,
+    ownerType: EvidenceOwnerType,
+    ownerId: string,
+  ) => Promise<EvidenceUploadResult>;
   onChangePhone: (phone: string) => Promise<AuthResult>;
   onChangePassword: (currentPassword: string, newPassword: string) => Promise<AuthResult>;
   onDeactivateAccount: (password: string, confirmation: string, reason: string) => Promise<AuthResult>;
@@ -7120,6 +7433,7 @@ function ProfileView({
   const [requestingPrivacyDeletion, setRequestingPrivacyDeletion] = useState(false);
   const [savingProfile, setSavingProfile] = useState(false);
   const [requestingClaimId, setRequestingClaimId] = useState("");
+  const [uploadingClaimId, setUploadingClaimId] = useState("");
   const lastProfileUserIdRef = useRef(currentUser.id);
 
   useEffect(() => {
@@ -7201,6 +7515,7 @@ function ProfileView({
         reason: claim.submittedReason ?? "",
         evidenceText: claim.evidenceText ?? "",
         evidenceUrl: claim.evidenceUrl ?? "",
+        evidenceFiles: claim.evidenceFiles ?? [],
       };
       return { ...previous, [claim.id]: { ...current, ...patch } };
     });
@@ -7211,20 +7526,39 @@ function ProfileView({
       reason: claim.submittedReason ?? "",
       evidenceText: claim.evidenceText ?? "",
       evidenceUrl: claim.evidenceUrl ?? "",
+      evidenceFiles: claim.evidenceFiles ?? [],
     };
+
+  const attachClaimEvidenceFile = async (claim: ProfileClaim, file: File | null) => {
+    if (!file) return;
+    setUploadingClaimId(claim.id);
+    setProfileMessage("");
+    const result = await onUploadEvidenceFile(file, "claim", claim.id);
+    setUploadingClaimId("");
+    if (!result.ok || !result.file) {
+      setProfileMessage(result.message ?? "증빙 파일 업로드에 실패했습니다.");
+      return;
+    }
+    const draft = getClaimRequestDraft(claim);
+    updateClaimRequestDraft(claim, {
+      evidenceFiles: [...draft.evidenceFiles, result.file].slice(-3),
+    });
+    setProfileMessage("증빙 파일을 인증 요청에 첨부했습니다.");
+  };
 
   const requestVerification = async (claim: ProfileClaim) => {
     const requestDraft = getClaimRequestDraft(claim);
     const reason = requestDraft.reason.trim();
     const evidenceText = requestDraft.evidenceText.trim();
     const evidenceUrl = requestDraft.evidenceUrl.trim();
+    const evidenceFiles = requestDraft.evidenceFiles;
     if (!reason) {
       setProfileMessage("인증 요청 사유를 입력해주세요.");
       return;
     }
     setRequestingClaimId(claim.id);
     setProfileMessage("");
-    const result = await onRequestClaimVerification(claim.id, reason, evidenceText, evidenceUrl);
+    const result = await onRequestClaimVerification(claim.id, reason, evidenceText, evidenceUrl, evidenceFiles);
     setRequestingClaimId("");
     if (!result.ok) {
       setProfileMessage(result.message ?? "인증 요청에 실패했습니다.");
@@ -7537,6 +7871,7 @@ function ProfileView({
                         증빙 링크 열기
                       </a>
                     )}
+                    <EvidenceFileLinks files={claim.evidenceFiles} />
                     {claim.submittedReason && <small className="claim-review-note">제출 사유: {claim.submittedReason}</small>}
                     {claim.reviewMemo && <small className="claim-review-note">심사 메모: {claim.reviewMemo}</small>}
                     {claim.reviewerName && <small className="claim-review-note">심사자: {claim.reviewerName}</small>}
@@ -7561,6 +7896,21 @@ function ProfileView({
                         onChange={(event) => updateClaimRequestDraft(claim, { evidenceUrl: event.target.value })}
                         placeholder="증빙 URL (선택)"
                       />
+                      <label className="storage-file-action">
+                        <ImageUp size={15} aria-hidden />
+                        {uploadingClaimId === claim.id ? "증빙 업로드 중" : "증빙 파일 첨부"}
+                        <input
+                          type="file"
+                          accept="image/png,image/jpeg,image/webp,application/pdf,text/plain"
+                          disabled={uploadingClaimId === claim.id || requestingClaimId === claim.id}
+                          onChange={(event) => {
+                            const file = event.currentTarget.files?.[0] ?? null;
+                            void attachClaimEvidenceFile(claim, file);
+                            event.currentTarget.value = "";
+                          }}
+                        />
+                      </label>
+                      <EvidenceFileLinks files={requestDraft.evidenceFiles} />
                       <button
                         type="button"
                         onClick={() => {
@@ -7659,6 +8009,7 @@ function ProfileView({
               </button>
             </div>
           </div>
+          <PolicyDocumentLinks heading="약관 및 개인정보 동의" agreement={currentUser.agreements} showAcceptedStatus />
           <div className="phone-change-box">
             <div>
               <span>현재 전화번호</span>
@@ -9431,6 +9782,7 @@ function AdminView({
                               증빙 링크 열기
                             </a>
                           )}
+                          <EvidenceFileLinks files={claim.evidenceFiles} />
                           {claim.submittedAt && <small>제출 시각: {claim.submittedAt}</small>}
                         </div>
                         {canManage && (
@@ -9511,6 +9863,7 @@ function AdminView({
                         {aiAppealStatusLabels[appeal.status]} · {(requester?.displayName ?? appeal.userName) || "알 수 없음"} · {appeal.createdAt}
                       </span>
                       {channel && <small>{channel.title}</small>}
+                      <EvidenceFileLinks files={appeal.evidenceFiles} />
                       {appeal.reviewMemo && <small>처리 메모: {appeal.reviewMemo}</small>}
                     </div>
                     {canManage && (
@@ -9600,6 +9953,7 @@ function AdminView({
                       {channel && <small>{channel.title}</small>}
                       <small>대상 ID: {report.targetId}</small>
                       {targetUser && <small>대상: {targetUser.displayName}</small>}
+                      <EvidenceFileLinks files={report.evidenceFiles} />
                       {report.assigneeName && <small>담당자: {report.assigneeName}</small>}
                       {report.reviewMemo && <small>처리 메모: {report.reviewMemo}</small>}
                       {report.statusHistory?.[0] && (
@@ -9994,6 +10348,7 @@ const readinessGuides: Record<string, ReadinessGuide> = {
       "RATE_LIMIT_WRITE_WINDOW_SECONDS=60",
       "RATE_LIMIT_MESSAGE_MAX=30",
       "RATE_LIMIT_REPORT_MAX=10",
+      "RATE_LIMIT_AI_JUDGE_MAX=6",
     ].join("\n"),
     steps: [
       "운영 탭의 Auth/SMS/Write limit 숫자가 모두 양수인지 확인합니다.",
@@ -10549,6 +10904,7 @@ function ReadinessPanel({
           data-login-max={rateLimits.loginMax}
           data-phone-request-max={rateLimits.phoneRequestMax}
           data-message-max={rateLimits.messageMax}
+          data-ai-judge-max={rateLimits.aiJudgeMax}
         >
           <span>
             <ShieldCheck size={15} aria-hidden />
@@ -10565,7 +10921,17 @@ function ReadinessPanel({
             <b>Write limit</b>
             <em>message {rateLimits.messageMax}/{rateLimits.writeWindowSeconds}s</em>
           </span>
+          <span>
+            <Brain size={15} aria-hidden />
+            <b>AI limit</b>
+            <em>judge {rateLimits.aiJudgeMax}/{rateLimits.authWindowSeconds}s</em>
+          </span>
         </div>
+      )}
+      {readiness && rateLimits?.warnings && rateLimits.warnings.length > 0 && (
+        <p className="quiet-text" data-smoke="readiness-rate-warning">
+          Rate limit warning: {rateLimits.warnings.join(", ")}
+        </p>
       )}
 
       {readiness && providerDiagnostics && (
@@ -11477,12 +11843,18 @@ function DebateResultSummary({
   currentUser,
   aiAppeals,
   onSubmitAiAppeal,
+  onUploadEvidenceFile,
 }: {
   channel: DebateChannel;
   users: User[];
   currentUser: User;
   aiAppeals: AiAppealRecord[];
-  onSubmitAiAppeal: (reason: string) => Promise<ActionResult>;
+  onSubmitAiAppeal: (reason: string, evidenceFiles?: EvidenceFileReference[]) => Promise<ActionResult>;
+  onUploadEvidenceFile: (
+    file: File,
+    ownerType: EvidenceOwnerType,
+    ownerId: string,
+  ) => Promise<EvidenceUploadResult>;
 }) {
   const [copied, setCopied] = useState(false);
   const [copyError, setCopyError] = useState("");
@@ -11490,6 +11862,8 @@ function DebateResultSummary({
   const [appealBusy, setAppealBusy] = useState(false);
   const [appealMessage, setAppealMessage] = useState("");
   const [appealError, setAppealError] = useState("");
+  const [appealEvidenceFiles, setAppealEvidenceFiles] = useState<EvidenceFileReference[]>([]);
+  const [appealEvidenceUploading, setAppealEvidenceUploading] = useState(false);
   const aiJudgement = channel.aiJudgement;
   const finalResult = channel.finalResult;
   if (!aiJudgement || !finalResult) return null;
@@ -11566,6 +11940,20 @@ function DebateResultSummary({
     }
   };
 
+  const attachAppealEvidence = async (file: File | null) => {
+    if (!file) return;
+    setAppealEvidenceUploading(true);
+    setAppealError("");
+    const result = await onUploadEvidenceFile(file, "ai_appeal", channel.id);
+    setAppealEvidenceUploading(false);
+    if (!result.ok || !result.file) {
+      setAppealError(result.message ?? "이의제기 증빙 파일 업로드에 실패했습니다.");
+      return;
+    }
+    setAppealEvidenceFiles((previous) => [...previous, result.file as EvidenceFileReference].slice(-3));
+    setAppealMessage("이의제기 증빙 파일을 첨부했습니다.");
+  };
+
   const submitAppeal = async (event: FormEvent) => {
     event.preventDefault();
     const reason = appealReason.trim();
@@ -11576,13 +11964,14 @@ function DebateResultSummary({
     setAppealBusy(true);
     setAppealMessage("");
     setAppealError("");
-    const result = await onSubmitAiAppeal(reason);
+    const result = await onSubmitAiAppeal(reason, appealEvidenceFiles);
     setAppealBusy(false);
     if (!result.ok) {
       setAppealError(result.message ?? "AI 판정 이의제기 제출에 실패했습니다.");
       return;
     }
     setAppealReason("");
+    setAppealEvidenceFiles([]);
     setAppealMessage("이의제기를 운영자에게 보냈습니다.");
   };
 
@@ -11683,6 +12072,27 @@ function DebateResultSummary({
               rows={3}
               disabled={!canAppeal || appealBusy}
             />
+          )}
+          {currentAppeal ? (
+            <EvidenceFileLinks files={currentAppeal.evidenceFiles} />
+          ) : (
+            <>
+              <label className="storage-file-action">
+                <ImageUp size={15} aria-hidden />
+                {appealEvidenceUploading ? "증빙 업로드 중" : "증빙 파일 첨부"}
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,application/pdf,text/plain"
+                  disabled={!canAppeal || appealBusy || appealEvidenceUploading}
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0] ?? null;
+                    void attachAppealEvidence(file);
+                    event.currentTarget.value = "";
+                  }}
+                />
+              </label>
+              <EvidenceFileLinks files={appealEvidenceFiles} />
+            </>
           )}
         </div>
         {!currentAppeal && (

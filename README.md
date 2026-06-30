@@ -88,6 +88,19 @@ The admin readiness panel also exports a launch handoff package (`nosu-best-laun
 
 Render는 현재 배포 커밋을 `RENDER_GIT_COMMIT`으로 제공합니다. 따라서 Render에서는 `RELEASE_COMMIT`을 수동으로 오래 남겨두지 말고, 수동 값이 필요하면 Render 밖 배포에서만 사용하세요. `/api/health`의 `runtime.release`는 `commitSource`, `missing`, `staleEnv`를 함께 반환해 현재 커밋, 미설정 값, 오래된 수동 환경변수를 구분합니다. `RELEASE_BUILD_TIME`은 자동 주입되지 않으면 `missing`으로 표시되며, 정적 과거 시각을 repo나 Render Blueprint에 넣지 않습니다.
 
+### Render 장애 대응 runbook
+
+Render Blueprint의 `healthCheckPath`는 `/api/health`이고, 서버도 같은 경로에서 health JSON을 반환합니다. 정상 운영이면 HTTP 200과 `ok=true`, 종료 중이면 HTTP 503과 `ok=false`가 내려옵니다. 응답의 `monitoring` 요약에서 release version/commit, storage mode, process uptime, shutdown 상태를 먼저 확인합니다.
+
+장애 확인 순서:
+
+1. Render Dashboard > Web Service > Events에서 최근 deploy, restart, crash, health check failure 시각을 확인합니다.
+2. Render Dashboard > Logs에서 `Nosu Best API running`, `Runtime`, `Nosu Best API shutdown requested`, `Uncaught exception`, `Unhandled rejection` 로그를 시간순으로 확인합니다. 이 로그는 release와 storage mode만 남기며 secret 값을 출력하지 않습니다.
+3. `GET https://<서비스 도메인>/api/health`를 호출해 `monitoring.release.commitShort`, `monitoring.storage.storageMode`, `monitoring.process.uptimeSeconds`, `runtime.providerDiagnostics`를 확인합니다.
+4. storage가 `file` 또는 `snapshot`이면 Render free instance 재시작/재배포 때 데이터가 유지되지 않을 수 있으므로 Supabase normalized 전환 상태를 먼저 확인합니다.
+5. 최근 배포 직후 장애라면 Render Dashboard에서 직전 성공 deploy로 rollback하거나 Git에서 마지막 정상 커밋을 다시 배포합니다. rollback 뒤에도 `/api/health`가 200이 될 때까지 새 운영 조치는 멈춥니다.
+6. Render free plan은 유휴 시간 뒤 spin-down 될 수 있어 첫 요청이 느릴 수 있습니다. 첫 요청 지연만 있고 `/api/health`가 곧 200으로 돌아오면 장애가 아니라 cold start로 기록합니다.
+
 인증 플로우만 빠르게 검증하는 독립 smoke:
 
 ```powershell
@@ -153,7 +166,7 @@ npm run smoke:voice:managed
 - `POST /api/auth/phone/verify`: 발급된 인증번호 검증. 만료, 재발송 제한, 시도 횟수 제한, 인증된 번호 중복 방지를 적용합니다.
 - `POST /api/auth/password`: 현재 비밀번호 확인 후 새 비밀번호 저장.
 - `POST /api/auth/account/deactivate`: 현재 계정을 탈퇴 처리합니다. 기존 토론 기록 보존을 위해 물리 삭제 대신 로그인 차단과 프로필 익명화를 적용합니다.
-- `GET /api/admin/readiness`: 운영자용 런칭 준비도 점검. 저장소, SMS, AI 판정, 보안 스위치, Auth/SMS 남용 방지 한도, 실시간 연결 상태를 체크리스트로 반환하고 `runtime.providerDiagnostics`로 SMS/OAuth/AI/storage provider 상태를 secret 없이 함께 반환합니다. `launch` 요약에 런칭 가능/보류 판단, 막힌 항목, 다음 액션, 필수 env 목록, `.env.production` 초안, 배포 런북 명령, Markdown/JSON 리포트 파일명, 런칭 증적 체크리스트, promotion gate 산출물 상태를 함께 제공합니다. 운영 탭의 env 초안 저장/명령 복사/리포트 저장/증적 패키지 저장 버튼으로 현재 blocker/warning, promotion gate next action, 배포 전 기록을 남길 수 있습니다.
+- `GET /api/admin/readiness`: 운영자용 런칭 준비도 점검. 저장소, 백업/복구 보존 상태, SMS, AI 판정, 보안 스위치, Auth/SMS 남용 방지 한도, 실시간 연결 상태를 체크리스트로 반환하고 `runtime.providerDiagnostics`로 SMS/OAuth/AI/storage provider 상태를 secret 없이 함께 반환합니다. `launch` 요약에 런칭 가능/보류 판단, 막힌 항목, 다음 액션, 필수 env 목록, `.env.production` 초안, 배포 런북 명령, Markdown/JSON 리포트 파일명, 런칭 증적 체크리스트, promotion gate 산출물 상태를 함께 제공합니다. 운영 탭의 env 초안 저장/명령 복사/리포트 저장/증적 패키지 저장 버튼으로 현재 blocker/warning, promotion gate next action, 배포 전 기록을 남길 수 있습니다.
 - 준비도 항목은 `phase`, `priority`, `required`를 함께 반환합니다. 운영 탭은 이를 이용해 필수 미완료, 권장 확인, 저장소/인증/배포/음성 토론 단계별 진행률을 보여줍니다.
 - `POST /api/admin/service-notice`: 운영자/운영진이 점검, 장애, 정책 변경 공지를 게시하거나 내립니다. 공지는 수동 해제 또는 1/4/24/72시간 자동 해제 만료 시간을 둘 수 있고, 만료된 공지는 공용 상태와 로그인 후 배너에서 자동으로 사라집니다. 활성 공지는 모든 로그인 사용자에게 상단 배너로 표시되고 파일 저장소, Supabase 스냅샷, Supabase 정규 `app_settings.service_notice`에 함께 저장되며 감사 로그에 남습니다.
 - 운영 상황 스냅샷: 운영 탭에서 현재 공용 서비스 상태, 릴리스 식별자, 활성 공지, readiness 요약, 저장소 점검 결과, 열린 신고/활성 제재, 최근 감사 로그를 JSON/Markdown으로 저장해 점검 공유나 장애 대응 기록으로 남길 수 있습니다.
@@ -270,6 +283,22 @@ SOLAPI_API_BASE_URL=https://api.solapi.com
 
 배포 환경에서는 `API_HOST=0.0.0.0`으로 서버가 외부 요청을 받을 수 있게 하고, `ALLOWED_ORIGINS`에는 실제 프론트엔드 도메인만 쉼표로 구분해 넣습니다. Render 배포에서는 `RENDER_EXTERNAL_URL`이 있으면 서버가 기본 origin으로 사용할 수 있지만, 운영에서는 Render Environment에 실제 공개 URL을 명시하는 편이 더 명확합니다.
 
+## 운영 정책 문서
+
+앱의 공개 정책 링크와 동의 버전은 `src/App.tsx`의 `requiredAgreementVersion`, `requiredAgreementDocuments`, `policyDocumentLinks`에서 관리합니다. 로그인 전 화면, 필수 동의 화면, 프로필 화면은 같은 값을 사용해 `/policies/terms.html`, `/policies/privacy.html`, `/policies/community.html` 위치를 표시합니다.
+
+실제 운영 문안은 이 저장소에 임시 문구로 작성하지 말고, 배포 전에 `public/policies/terms.html`, `public/policies/privacy.html`, `public/policies/community.html` 위치에 검토 완료본을 배치합니다. PDF나 외부 CMS를 쓰는 경우에도 `policyDocumentLinks`의 `href`와 `replacementPath`를 운영 위치에 맞춰 같이 바꿉니다.
+
+약관/개인정보 문서가 바뀌면 `requiredAgreementVersion`과 `requiredAgreementDocuments`의 문서 ID를 함께 올립니다. 기존 사용자 기록의 `requiredVersion` 또는 `documents` 값이 새 필수 값과 다르면 `normalizeAgreementState`가 `requiredAccepted=false`로 처리하므로 재동의 게이트에 연결할 수 있습니다.
+
+배포 전 체크:
+
+1. 공개 URL 3개가 실제 검토 완료 문서로 열리는지 확인합니다.
+2. placeholder 문구, 샘플 연락처, 검토 전 문안이 남아 있지 않은지 확인합니다.
+3. 로그인 전 화면, 필수 동의 화면, 프로필 화면의 버전 표시가 같은지 확인합니다.
+4. `npm.cmd run build`를 실행합니다.
+5. 후속 readiness 연결 시 `policyDocumentReview.readinessCheckId` 값인 `policy_documents`와 `placeholderCopyPresent`를 `/api/admin/readiness` 점검에 연결합니다.
+
 운영 전환용 Supabase 저장소 순서:
 
 1. Supabase SQL Editor에서 `supabase/normalized-schema.sql`을 실행합니다.
@@ -279,6 +308,25 @@ SOLAPI_API_BASE_URL=https://api.solapi.com
 5. 기존 file/snapshot 상태를 정규 테이블로 옮길 때만 운영자 세션에서 `POST /api/admin/sync-normalized`를 실행합니다.
 
 `SUPABASE_STORAGE_MODE=snapshot`과 `file` 저장소는 개발/데모 fallback입니다. `NODE_ENV=production`에서 Supabase URL, service-role key, anon key, normalized mode 중 하나라도 빠지면 readiness의 저장소 항목은 운영 blocker로 남습니다.
+
+## 운영 백업/복구 및 보존 절차
+
+운영 데이터 보호의 기준 백업은 Supabase 프로젝트의 데이터베이스 백업입니다. 앱 내부의 일반 `state-export`는 운영자가 현재 앱 상태를 내려받아 점검하는 보조 스냅샷이며, 비밀번호 secret이 제거되어 전체 운영 DB 백업을 대체하지 않습니다. `state-export/secure`는 credential 포함 비상 복구용 파일이므로 암호화된 저장소에만 보관하고 이슈, 로그, 채팅, 저장소에 첨부하지 않습니다.
+
+운영 전 확인 순서:
+
+1. Supabase Dashboard에서 현재 프로젝트의 백업 또는 PITR 제공 상태와 마지막 백업 시각을 확인합니다.
+2. 운영자 세션에서 `GET /api/admin/storage-check`로 정규 테이블 schema와 row 수를 확인합니다.
+3. 운영 탭에서 감사 로그 JSON/CSV를 내려받아 별도 보관합니다. `MAX_AUDIT_LOGS` 기본값은 300이고, readiness의 `backup_retention` 항목은 80% 이상 사용 시 warning, 한계 도달 시 blocker로 표시합니다.
+4. 운영 탭에서 일반 상태 백업을 내려받아 구조를 확인하되, 운영 복구 원본으로 쓰지 않습니다.
+5. 비상 복구 리허설은 운영 서버가 아닌 로컬 또는 별도 스테이징에서 `state-export/secure` 백업을 검증한 뒤 `state-restore`를 실행해 관리자 계정, 채널, 감사 로그, 저장소 점검 결과가 돌아오는지 확인합니다.
+6. 리허설 결과와 백업 확인 시각을 운영 상황 스냅샷 Markdown/JSON에 남깁니다.
+
+복구 판단:
+
+- Supabase 장애나 데이터 손상은 먼저 Supabase 백업/PITR 복구 가능성을 확인합니다.
+- 앱 내부 보안 백업 복구는 전체 상태를 되돌리는 비상 절차이므로, 운영 중인 DB에 바로 실행하지 말고 사용자 영향과 최신 데이터 유실 범위를 먼저 확인합니다.
+- 감사 로그가 한계에 가까우면 새 운영 조치를 계속하기 전에 `GET /api/admin/audit-export` 또는 운영 탭 다운로드로 로그를 보관합니다.
 
 ## 실제 간편 로그인 OAuth
 

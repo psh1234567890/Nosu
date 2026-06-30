@@ -37,8 +37,28 @@ create table if not exists public.nb_user_claims (
   label text not null,
   value text not null,
   status text not null,
+  submitted_reason text,
+  evidence_text text,
+  evidence_url text,
+  evidence_files jsonb not null default '[]'::jsonb,
+  submitted_at text,
+  reviewer_id text,
+  reviewer_name text,
+  reviewed_at text,
+  review_memo text,
   updated_at timestamptz not null default now()
 );
+
+alter table public.nb_user_claims
+  add column if not exists submitted_reason text,
+  add column if not exists evidence_text text,
+  add column if not exists evidence_url text,
+  add column if not exists evidence_files jsonb not null default '[]'::jsonb,
+  add column if not exists submitted_at text,
+  add column if not exists reviewer_id text,
+  add column if not exists reviewer_name text,
+  add column if not exists reviewed_at text,
+  add column if not exists review_memo text;
 
 create table if not exists public.nb_rooms (
   id text primary key,
@@ -129,8 +149,12 @@ create table if not exists public.nb_reports (
   status text not null default 'open',
   created_at_text text not null,
   resolved_at_text text,
-  resolved_by text references public.nb_users(id) on delete set null
+  resolved_by text references public.nb_users(id) on delete set null,
+  evidence_files jsonb not null default '[]'::jsonb
 );
+
+alter table public.nb_reports
+  add column if not exists evidence_files jsonb not null default '[]'::jsonb;
 
 create table if not exists public.nb_coin_ledger (
   id text primary key,
