@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -97,6 +99,38 @@ function assertReadinessReady(readiness, id) {
   return item;
 }
 
+function createSmokeSeedState() {
+  return {
+    users: [
+      {
+        id: "u_admin",
+        loginId: "nosu",
+        password: "demo",
+        authProvider: "local",
+        phone: "010-0000-2026",
+        phoneVerified: true,
+        displayName: "Nosu Admin",
+        role: "admin",
+        coins: 1200,
+        ownedItemIds: [],
+        claims: [],
+        stats: { wins: 0, losses: 0, aiRating: 50, voteTrust: 50 },
+      },
+    ],
+    rooms: [],
+    channels: [],
+    ledger: [],
+    reports: [],
+    sanctions: [],
+    notifications: [],
+    auditLogs: [],
+    aiAppeals: [],
+    privacyRequests: [],
+    serviceNotice: null,
+    currentUserId: null,
+  };
+}
+
 async function waitForHealth(url, deadline) {
   let lastError = null;
   while (Date.now() < deadline) {
@@ -128,6 +162,13 @@ async function main() {
   assert(existsSync(DIST_INDEX), "dist/index.html is missing. Run `npm run build` before `npm run smoke:static`.");
 
   const logs = [];
+  const dataDir = await mkdtemp(path.join(tmpdir(), "nosu-static-smoke-"));
+  const savedAt = new Date().toISOString();
+  await writeFile(
+    path.join(dataDir, "state.json"),
+    JSON.stringify({ state: createSmokeSeedState(), savedAt }, null, 2),
+    "utf8",
+  );
   const server = spawn(process.execPath, ["server/index.js"], {
     cwd: ROOT_DIR,
     env: {
@@ -136,11 +177,21 @@ async function main() {
       API_HOST,
       API_PORT: String(API_PORT),
       ALLOWED_ORIGINS: PUBLIC_ORIGIN,
+      DATA_DIR: dataDir,
+      SUPABASE_URL: "",
+      SUPABASE_SERVICE_ROLE_KEY: "",
+      SUPABASE_SECRET_KEY: "",
+      SUPABASE_ANON_KEY: "",
+      VITE_SUPABASE_URL: "",
+      VITE_SUPABASE_ANON_KEY: "",
+      SUPABASE_STORAGE_MODE: "file",
       SERVE_STATIC_APP: "true",
       ENABLE_DEMO_AUTH: "false",
       ENABLE_OPEN_STATE_WRITE: "false",
       PHONE_CODE_HIDE_DEBUG: "true",
       AI_JUDGE_FORCE_LOCAL: "true",
+      PLATFORM_ADMIN_LOGIN_IDS: "nosu",
+      PLATFORM_ADMIN_USER_IDS: "",
     },
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
@@ -259,6 +310,7 @@ async function main() {
     process.exitCode = 1;
   } finally {
     await stopServer(server);
+    await rm(dataDir, { recursive: true, force: true });
   }
 }
 
